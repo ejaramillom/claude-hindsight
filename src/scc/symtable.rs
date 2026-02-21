@@ -75,4 +75,14 @@ impl SymTable {
     pub fn contains(&self, id: u64) -> bool {
         self.symbols.iter().any(|(k, _)| *k == id)
     }
+
+    /// Merge another SymTable into this one.
+    pub fn merge(&mut self, other: &SymTable) {
+        for (id, text) in &other.symbols {
+            if !self.contains(*id) {
+                self.symbols.push((*id, text.clone()));
+                self.reverse_map.insert(text.clone(), *id);
+            }
+        }
+    }
 }

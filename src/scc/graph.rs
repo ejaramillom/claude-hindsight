@@ -114,6 +114,16 @@ impl State {
         id
     }
 
+    /// Find a goal by its text_sym.
+    pub fn find_goal_by_sym(&self, text_sym: u64) -> Option<&Goal> {
+        self.goals.iter().find(|g| g.text_sym == text_sym)
+    }
+
+    /// Find a decision by its text_sym.
+    pub fn find_decision_by_sym(&self, text_sym: u64) -> Option<&Decision> {
+        self.decisions.iter().find(|d| d.text_sym == text_sym)
+    }
+
     /// Canonicalize the state by sorting all nodes and re-mapping IDs to ensure 
     /// that identical semantic content results in an identical byte representation.
     pub fn canonicalize(&mut self) {

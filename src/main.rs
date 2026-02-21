@@ -177,6 +177,19 @@ enum CapsuleAction {
         /// Path to the head capsule file
         head: String,
     },
+
+    /// Merge two diverging capsules from a common base
+    Merge {
+        /// Common ancestor (base)
+        base: String,
+        /// First head (e.g. your branch)
+        head_a: String,
+        /// Second head (e.g. remote branch)
+        head_b: String,
+        /// Output file path (.scc)
+        #[arg(short, long, default_value = "merged.scc")]
+        output: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -303,6 +316,9 @@ fn run() -> Result<()> {
             CapsuleAction::Hydrate { path } => commands::capsule::hydrate(path)?,
             CapsuleAction::Status { path } => commands::capsule::status(path)?,
             CapsuleAction::Diff { base, head } => commands::capsule::diff(base, head)?,
+            CapsuleAction::Merge { base, head_a, head_b, output } => {
+                commands::capsule::merge(base, head_a, head_b, output)?
+            }
         },
         Commands::Serve { port, open } => {
             commands::serve::run(port, open)?;
