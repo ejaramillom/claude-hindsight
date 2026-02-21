@@ -1,5 +1,6 @@
 //! Command implementations for Claude Hindsight CLI
 
+pub mod capsule;
 pub mod config;
 pub mod export;
 pub mod init;

@@ -32,6 +32,9 @@ pub enum HindsightError {
 
     #[error("Invalid session format: {0}")]
     InvalidSession(String),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 impl From<serde_json::Error> for HindsightError {
