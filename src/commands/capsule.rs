@@ -171,3 +171,17 @@ pub fn diff(base_path: String, head_path: String) -> Result<()> {
     
     Ok(())
 }
+
+pub fn merge(base_path: String, head_a_path: String, head_b_path: String, output: String) -> Result<()> {
+    let base = Capsule::load(&base_path).context(format!("Failed to load base capsule from {}", base_path))?;
+    let head_a = Capsule::load(&head_a_path).context(format!("Failed to load head-a capsule from {}", head_a_path))?;
+    let head_b = Capsule::load(&head_b_path).context(format!("Failed to load head-b capsule from {}", head_b_path))?;
+    
+    let merged = Capsule::merge(&base, &head_a, &head_b).context("Failed to merge capsules")?;
+    
+    merged.save(&output).context("Failed to save merged capsule")?;
+    println!("Capsules merged successfully into: {}", output);
+    println!("New Hash: {}", hex::encode(&merged.header.hash));
+    
+    Ok(())
+}

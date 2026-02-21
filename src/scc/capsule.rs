@@ -179,6 +179,145 @@ impl Capsule {
         Ok(())
     }
 
+    /// Perform a 3-way merge of two diverging capsules from a common base.
+    pub fn merge(base: &Capsule, head_a: &Capsule, head_b: &Capsule) -> Result<Capsule> {
+        if head_a.header.root_id != base.header.root_id || head_b.header.root_id != base.header.root_id {
+            return Err(anyhow!("Cannot merge capsules with different Root IDs"));
+        }
+
+        let mut merged = Capsule::new(base.header.root_id.clone(), head_a.header.hash.clone());
+        
+        // 1. Merge Symbol Tables.
+        merged.symtable.merge(&base.symtable);
+        merged.symtable.merge(&head_a.symtable);
+        merged.symtable.merge(&head_b.symtable);
+        merged.symtable.canonicalize();
+
+        // 2. Union of Axioms, Resources, and Pending.
+        Self::merge_simple_sets(&mut merged, base, head_a, head_b);
+
+        // 3. Merge Goals.
+        Self::merge_goals(&mut merged, base, head_a, head_b)?;
+
+        // 4. Merge Decisions.
+        Self::merge_decisions(&mut merged, base, head_a, head_b);
+
+        // Final Canonicalization.
+        merged.commit();
+        Ok(merged)
+    }
+
+    fn merge_simple_sets(merged: &mut Capsule, base: &Capsule, head_a: &Capsule, head_b: &Capsule) {
+        let mut all_axioms: std::collections::HashSet<u64> = base.state.axioms.iter().map(|n| n.text_sym).collect();
+        all_axioms.extend(head_a.state.axioms.iter().map(|n| n.text_sym));
+        all_axioms.extend(head_b.state.axioms.iter().map(|n| n.text_sym));
+        for sym in all_axioms { merged.state.add_axiom(sym); }
+
+        let mut all_resources: std::collections::HashSet<u64> = base.state.resources.iter().map(|n| n.text_sym).collect();
+        all_resources.extend(head_a.state.resources.iter().map(|n| n.text_sym));
+        all_resources.extend(head_b.state.resources.iter().map(|n| n.text_sym));
+        for sym in all_resources { merged.state.add_resource(sym); }
+
+        let mut all_pending: std::collections::HashSet<u64> = base.state.pending.iter().map(|n| n.text_sym).collect();
+        all_pending.extend(head_a.state.pending.iter().map(|n| n.text_sym));
+        all_pending.extend(head_b.state.pending.iter().map(|n| n.text_sym));
+        for sym in all_pending { merged.state.add_pending(sym); }
+    }
+
+    fn merge_goals(merged: &mut Capsule, base: &Capsule, head_a: &Capsule, head_b: &Capsule) -> Result<()> {
+        let mut all_goal_syms: std::collections::HashSet<u64> = base.state.goals.iter().map(|n| n.text_sym).collect();
+        all_goal_syms.extend(head_a.state.goals.iter().map(|n| n.text_sym));
+        all_goal_syms.extend(head_b.state.goals.iter().map(|n| n.text_sym));
+
+        for sym in all_goal_syms {
+            let g_base = base.state.find_goal_by_sym(sym);
+            let g_a = head_a.state.find_goal_by_sym(sym);
+            let g_b = head_b.state.find_goal_by_sym(sym);
+
+            let status = Self::resolve_goal_status(merged, sym, g_base, g_a, g_b)?;
+
+            let merged_goal = crate::scc::graph::Goal {
+                id: 0, // Will be re-indexed.
+                text_sym: sym,
+                status,
+                parent_ids: Vec::new(),
+            };
+            merged.state.goals.push(merged_goal);
+        }
+
+        // Re-link goal parents using text_sym.
+        let mut goal_copies = merged.state.goals.clone();
+        for (i, goal) in goal_copies.iter_mut().enumerate() {
+            let mut parent_syms: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            if let Some(b) = base.state.find_goal_by_sym(goal.text_sym) { parent_syms.extend(b.parent_ids.iter().map(|&pid| base.state.goals[pid as usize].text_sym)); }
+            if let Some(a) = head_a.state.find_goal_by_sym(goal.text_sym) { parent_syms.extend(a.parent_ids.iter().map(|&pid| head_a.state.goals[pid as usize].text_sym)); }
+            if let Some(h) = head_b.state.find_goal_by_sym(goal.text_sym) { parent_syms.extend(h.parent_ids.iter().map(|&pid| head_b.state.goals[pid as usize].text_sym)); }
+            
+            for psym in parent_syms {
+                if let Some(pos) = merged.state.goals.iter().position(|g| g.text_sym == psym) {
+                    goal.parent_ids.push(pos as u32);
+                }
+            }
+            goal.id = i as u32;
+        }
+        merged.state.goals = goal_copies;
+        Ok(())
+    }
+
+    fn resolve_goal_status(merged: &Capsule, sym: u64, g_base: Option<&crate::scc::graph::Goal>, g_a: Option<&crate::scc::graph::Goal>, g_b: Option<&crate::scc::graph::Goal>) -> Result<GoalStatus> {
+        match (g_base, g_a, g_b) {
+            (Some(b), Some(a), Some(h)) => {
+                if a.status == h.status { Ok(a.status) }
+                else if a.status == b.status { Ok(h.status) }
+                else if h.status == b.status { Ok(a.status) }
+                else {
+                    if (a.status == GoalStatus::Completed && (h.status == GoalStatus::Blocked || h.status == GoalStatus::Deprecated)) ||
+                       (h.status == GoalStatus::Completed && (a.status == GoalStatus::Blocked || a.status == GoalStatus::Deprecated)) {
+                        let text = merged.symtable.get(sym).unwrap_or("unknown");
+                        Err(anyhow!("Conflict in Goal status for '{}': {:?} vs {:?}", text, a.status, h.status))
+                    } else {
+                        Ok(std::cmp::max(a.status, h.status))
+                    }
+                }
+            }
+            (_, Some(a), Some(h)) => Ok(std::cmp::max(a.status, h.status)),
+            (_, Some(a), None) => Ok(a.status),
+            (_, None, Some(h)) => Ok(h.status),
+            (Some(b), None, None) => Ok(b.status),
+            _ => Ok(GoalStatus::Open),
+        }
+    }
+
+    fn merge_decisions(merged: &mut Capsule, base: &Capsule, head_a: &Capsule, head_b: &Capsule) {
+        let mut all_decision_syms: std::collections::HashSet<u64> = base.state.decisions.iter().map(|n| n.text_sym).collect();
+        all_decision_syms.extend(head_a.state.decisions.iter().map(|n| n.text_sym));
+        all_decision_syms.extend(head_b.state.decisions.iter().map(|n| n.text_sym));
+
+        for sym in all_decision_syms {
+            let d_base = base.state.find_decision_by_sym(sym);
+            let d_a = head_a.state.find_decision_by_sym(sym);
+            let d_b = head_b.state.find_decision_by_sym(sym);
+
+            let mut addressed_goal_syms: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            if let Some(d) = d_base { addressed_goal_syms.extend(d.goal_ids.iter().map(|&gid| base.state.goals[gid as usize].text_sym)); }
+            if let Some(d) = d_a { addressed_goal_syms.extend(d.goal_ids.iter().map(|&gid| head_a.state.goals[gid as usize].text_sym)); }
+            if let Some(d) = d_b { addressed_goal_syms.extend(d.goal_ids.iter().map(|&gid| head_b.state.goals[gid as usize].text_sym)); }
+
+            let mut decision = crate::scc::graph::Decision {
+                id: merged.state.decisions.len() as u32,
+                text_sym: sym,
+                goal_ids: Vec::new(),
+            };
+
+            for gsym in addressed_goal_syms {
+                if let Some(pos) = merged.state.goals.iter().position(|g| g.text_sym == gsym) {
+                    decision.goal_ids.push(pos as u32);
+                }
+            }
+            merged.state.decisions.push(decision);
+        }
+    }
+
     /// Return a token-efficient, rehydrated prompt from the capsule.
     pub fn rehydrate(&self) -> String {
         let mut output = String::new();
