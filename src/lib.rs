@@ -7,6 +7,7 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod parser;
+pub mod scc;
 pub mod search;
 pub mod server;
 pub mod storage;

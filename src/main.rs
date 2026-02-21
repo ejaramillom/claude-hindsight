@@ -128,6 +128,12 @@ enum Commands {
         verbose: bool,
     },
 
+    /// Create or rehydrate a Semantic Context Capsule (SCC)
+    Capsule {
+        #[command(subcommand)]
+        action: CapsuleAction,
+    },
+
     /// Start the web dashboard server
     Serve {
         /// Port to listen on
@@ -137,6 +143,25 @@ enum Commands {
         /// Open browser after starting
         #[arg(long)]
         open: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CapsuleAction {
+    /// Create a new capsule from a session
+    Create {
+        /// Session ID
+        session_id: String,
+
+        /// Output file path (.scc)
+        #[arg(short, long, default_value = "session.scc")]
+        output: String,
+    },
+
+    /// Rehydrate a capsule into a prompt
+    Hydrate {
+        /// Path to the capsule file (.scc)
+        path: String,
     },
 }
 
@@ -257,6 +282,12 @@ fn run() -> Result<()> {
         Commands::Reindex { verbose } => {
             commands::reindex::run(verbose)?;
         }
+        Commands::Capsule { action } => match action {
+            CapsuleAction::Create { session_id, output } => {
+                commands::capsule::create(session_id, output)?
+            }
+            CapsuleAction::Hydrate { path } => commands::capsule::hydrate(path)?,
+        },
         Commands::Serve { port, open } => {
             commands::serve::run(port, open)?;
         }
