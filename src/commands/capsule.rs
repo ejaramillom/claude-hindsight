@@ -130,10 +130,17 @@ fn map_tool_use_node(capsule: &mut Capsule, node: &crate::parser::ExecutionNode)
     }
 }
 
-pub fn hydrate(path: String) -> Result<()> {
+pub fn hydrate(path: String, project_dir: Option<String>) -> Result<()> {
     let capsule = Capsule::load(&path).context(format!("Failed to load capsule from {}", path))?;
-    let prompt = capsule.rehydrate();
-    println!("{}", prompt);
+    
+    if let Some(dir) = project_dir {
+        capsule.project(&dir).context(format!("Failed to project capsule into {}", dir))?;
+        println!("Capsule projected into: {}", dir);
+    } else {
+        let prompt = capsule.rehydrate();
+        println!("{}", prompt);
+    }
+    
     Ok(())
 }
 

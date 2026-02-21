@@ -10,8 +10,9 @@ Implementing the **Semantic Context Capsule (SCC)**, a token-efficient binary fo
 ## Current Status
 - Completed: SCC v0 core architecture, CLI implementation (`create`, `hydrate`, `status`, `diff`, `merge`), content-addressed storage, and **Step 7: 3-way Context Merging & Conflict Resolution**.
 - Completed: **Comprehensive Code Refactoring** across the `src/` directory to remove nested logic, flatten loops, and improve maintainability.
-- In Progress: Designing the **Virtual Buffer Rehydration** logic (Step 8).
+- Completed: **Step 8: Virtual Buffer Rehydration** via `--project` flag to generate high-density `INDEX.md` and `manifest.json`.
+- In Progress: Designing the **Global Semantic Store** (Step 9).
 - Blocked: None.
 
 ## Next Step
-Implement **Step 8: Virtual Buffer Rehydration** to generate high-density `INDEX.md` and `manifest.json` projections from the merged capsule.
+Implement **Step 9: Global Semantic Store** for O(1) deduplication and retrieval of capsules across different projects.

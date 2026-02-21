@@ -395,4 +395,118 @@ impl Capsule {
         output.push_str("</scc_context>");
         output
     }
+
+    /// Project the capsule into a "Virtual Buffer" (INDEX.md and manifest.json) in the given directory.
+    pub fn project<P: AsRef<Path>>(&self, dir: P) -> Result<()> {
+        let dir = dir.as_ref();
+        if !dir.exists() {
+            std::fs::create_dir_all(dir).context("Failed to create projection directory")?;
+        }
+
+        // 1. Generate INDEX.md (High-density Markdown)
+        let index_path = dir.join("INDEX.md");
+        let mut index_content = String::new();
+        index_content.push_str(&format!("# Semantic Context Capsule (SCC)\n\n"));
+        index_content.push_str(&format!("- **Root ID:** `{}`\n", self.header.root_id));
+        index_content.push_str(&format!("- **Hash:** `{}`\n", hex::encode(&self.header.hash)));
+        index_content.push_str(&format!("- **Version:** `{}`\n", self.header.version));
+        index_content.push_str(&format!("- **Timestamp:** `{}`\n\n", chrono::DateTime::from_timestamp(self.header.timestamp as i64 / 1_000_000, 0).unwrap_or_default()));
+
+        if !self.state.axioms.is_empty() {
+            index_content.push_str("## AXIOMS\n");
+            for axiom in &self.state.axioms {
+                if let Some(text) = self.symtable.get(axiom.text_sym) {
+                    index_content.push_str(&format!("- {}\n", text));
+                }
+            }
+            index_content.push_str("\n");
+        }
+
+        if !self.state.goals.is_empty() {
+            index_content.push_str("## GOALS\n");
+            for goal in &self.state.goals {
+                if let Some(text) = self.symtable.get(goal.text_sym) {
+                    let status_char = match goal.status {
+                        GoalStatus::Open => " ",
+                        GoalStatus::Completed => "x",
+                        GoalStatus::Blocked => "!",
+                        GoalStatus::Deprecated => "-",
+                    };
+                    index_content.push_str(&format!("- [{}] G{}: {}\n", status_char, goal.id, text));
+                    for &pid in &goal.parent_ids {
+                        index_content.push_str(&format!("  - depends on G{}\n", pid));
+                    }
+                }
+            }
+            index_content.push_str("\n");
+        }
+
+        if !self.state.decisions.is_empty() {
+            index_content.push_str("## DECISIONS\n");
+            for (id, decision) in self.state.decisions.iter().enumerate() {
+                if let Some(text) = self.symtable.get(decision.text_sym) {
+                    index_content.push_str(&format!("- D{}: {}\n", id, text));
+                    for &gid in &decision.goal_ids {
+                        index_content.push_str(&format!("  - addresses G{}\n", gid));
+                    }
+                }
+            }
+            index_content.push_str("\n");
+        }
+
+        if !self.state.resources.is_empty() {
+            index_content.push_str("## RESOURCES\n");
+            for res in &self.state.resources {
+                if let Some(text) = self.symtable.get(res.text_sym) {
+                    index_content.push_str(&format!("- `{}`\n", text));
+                }
+            }
+            index_content.push_str("\n");
+        }
+
+        if !self.state.pending.is_empty() {
+            index_content.push_str("## PENDING\n");
+            for pending in &self.state.pending {
+                if let Some(text) = self.symtable.get(pending.text_sym) {
+                    index_content.push_str(&format!("- ? {}\n", text));
+                }
+            }
+        }
+
+        std::fs::write(index_path, index_content).context("Failed to write INDEX.md")?;
+
+        // 2. Generate manifest.json (Machine-readable simplified state)
+        let manifest_path = dir.join("manifest.json");
+        let manifest = serde_json::json!({
+            "header": {
+                "root_id": self.header.root_id,
+                "hash": hex::encode(&self.header.hash),
+                "timestamp": self.header.timestamp,
+                "version": self.header.version,
+            },
+            "axioms": self.state.axioms.iter().filter_map(|n| self.symtable.get(n.text_sym)).collect::<Vec<_>>(),
+            "goals": self.state.goals.iter().map(|g| {
+                serde_json::json!({
+                    "id": g.id,
+                    "text": self.symtable.get(g.text_sym).unwrap_or("unknown"),
+                    "status": format!("{:?}", g.status),
+                    "depends_on": g.parent_ids,
+                })
+            }).collect::<Vec<_>>(),
+            "decisions": self.state.decisions.iter().map(|d| {
+                serde_json::json!({
+                    "id": d.id,
+                    "text": self.symtable.get(d.text_sym).unwrap_or("unknown"),
+                    "addresses": d.goal_ids,
+                })
+            }).collect::<Vec<_>>(),
+            "resources": self.state.resources.iter().filter_map(|n| self.symtable.get(n.text_sym)).collect::<Vec<_>>(),
+            "pending": self.state.pending.iter().filter_map(|n| self.symtable.get(n.text_sym)).collect::<Vec<_>>(),
+        });
+
+        let manifest_json = serde_json::to_string_pretty(&manifest).context("Failed to serialize manifest.json")?;
+        std::fs::write(manifest_path, manifest_json).context("Failed to write manifest.json")?;
+
+        Ok(())
+    }
 }

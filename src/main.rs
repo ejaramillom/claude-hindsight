@@ -162,6 +162,10 @@ enum CapsuleAction {
     Hydrate {
         /// Path to the capsule file (.scc)
         path: String,
+
+        /// Optional directory to project the capsule as a Virtual Buffer (INDEX.md + manifest.json)
+        #[arg(short, long)]
+        project: Option<String>,
     },
 
     /// Show metadata and status of a capsule
@@ -313,7 +317,7 @@ fn run() -> Result<()> {
             CapsuleAction::Create { session_id, output } => {
                 commands::capsule::create(session_id, output)?
             }
-            CapsuleAction::Hydrate { path } => commands::capsule::hydrate(path)?,
+            CapsuleAction::Hydrate { path, project } => commands::capsule::hydrate(path, project)?,
             CapsuleAction::Status { path } => commands::capsule::status(path)?,
             CapsuleAction::Diff { base, head } => commands::capsule::diff(base, head)?,
             CapsuleAction::Merge { base, head_a, head_b, output } => {
