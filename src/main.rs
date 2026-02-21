@@ -163,6 +163,20 @@ enum CapsuleAction {
         /// Path to the capsule file (.scc)
         path: String,
     },
+
+    /// Show metadata and status of a capsule
+    Status {
+        /// Path to the capsule file (.scc)
+        path: String,
+    },
+
+    /// Compare two capsules (structural diff)
+    Diff {
+        /// Path to the base capsule file
+        base: String,
+        /// Path to the head capsule file
+        head: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -287,6 +301,8 @@ fn run() -> Result<()> {
                 commands::capsule::create(session_id, output)?
             }
             CapsuleAction::Hydrate { path } => commands::capsule::hydrate(path)?,
+            CapsuleAction::Status { path } => commands::capsule::status(path)?,
+            CapsuleAction::Diff { base, head } => commands::capsule::diff(base, head)?,
         },
         Commands::Serve { port, open } => {
             commands::serve::run(port, open)?;

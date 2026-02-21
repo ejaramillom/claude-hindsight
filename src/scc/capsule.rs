@@ -32,6 +32,25 @@ pub struct Capsule {
 }
 
 impl Capsule {
+    /// Get the default SCC store directory (~/.scc/store).
+    pub fn get_store_dir() -> Result<std::path::PathBuf> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
+        let store = home.join(".scc").join("store");
+        if !store.exists() {
+            std::fs::create_dir_all(&store).context("Failed to create SCC store directory")?;
+        }
+        Ok(store)
+    }
+
+    /// Save the capsule to the default store using its hash as the filename.
+    pub fn save_to_store(&self) -> Result<std::path::PathBuf> {
+        let hash_hex = hex::encode(&self.header.hash);
+        let store_dir = Self::get_store_dir()?;
+        let path = store_dir.join(format!("{}.scc", hash_hex));
+        self.save(&path)?;
+        Ok(path)
+    }
+
     /// Create a new empty capsule.
     pub fn new(root_id: String, parent_hash: Vec<u8>) -> Self {
         Self {
@@ -151,6 +170,12 @@ impl Capsule {
             }
         }
         
+        for pending in &self.state.pending {
+            if !self.symtable.contains(pending.text_sym) {
+                return Err(anyhow!("Pending references unknown SymID: {}", pending.text_sym));
+            }
+        }
+        
         Ok(())
     }
 
@@ -213,6 +238,17 @@ impl Capsule {
             for res in &self.state.resources {
                 if let Some(text) = self.symtable.get(res.text_sym) {
                     output.push_str(&format!("@ {}\n", text));
+                }
+            }
+            output.push_str("\n");
+        }
+
+        // Pending
+        if !self.state.pending.is_empty() {
+            output.push_str("## PENDING\n");
+            for pending in &self.state.pending {
+                if let Some(text) = self.symtable.get(pending.text_sym) {
+                    output.push_str(&format!("? {}\n", text));
                 }
             }
         }

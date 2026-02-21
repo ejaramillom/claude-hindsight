@@ -66,6 +66,7 @@ seahash = "4.1"
 prost = "0.13"
 zstd = "0.13"
 blake3 = "1.5"
+hex = "0.4"
 
 [build-dependencies]
 prost-build = "0.13"

@@ -23,6 +23,10 @@ mod tests {
         let jwt_sym = capsule.symtable.intern("Use JWT for sessions", SymCategory::Literal);
         let _decision_id = capsule.state.add_decision(jwt_sym);
         
+        // Add Pending
+        let next_sym = capsule.symtable.intern("Review Step 5", SymCategory::Literal);
+        capsule.state.add_pending(next_sym);
+        
         // Commit (calculates hash)
         capsule.commit();
         
@@ -35,7 +39,9 @@ mod tests {
         
         assert_eq!(loaded.header.version, 0);
         assert_eq!(loaded.state.goals.len(), 1);
+        assert_eq!(loaded.state.pending.len(), 1);
         assert_eq!(loaded.symtable.get(lang_sym), Some("Language: Rust"));
+        assert_eq!(loaded.symtable.get(next_sym), Some("Review Step 5"));
         assert_eq!(loaded.header.root_id, "test-session-uuid");
         assert_eq!(loaded.header.parent_hash, vec![0u8; 32]);
         
@@ -46,5 +52,7 @@ mod tests {
         assert!(prompt.contains("[ ] G0: Implement User Auth"));
         assert!(prompt.contains("## DECISIONS"));
         assert!(prompt.contains("* D0: Use JWT for sessions"));
+        assert!(prompt.contains("## PENDING"));
+        assert!(prompt.contains("? Review Step 5"));
     }
 }

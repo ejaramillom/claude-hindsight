@@ -47,3 +47,5 @@ docs/.doctrees/
 
 # OS
 Thumbs.db
+*/test_claude_data
+*.scc

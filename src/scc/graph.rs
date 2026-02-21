@@ -47,6 +47,13 @@ pub struct Resource {
     pub text_sym: u64,
 }
 
+/// An unresolved question or task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Pending {
+    /// Symbol ID for the content.
+    pub text_sym: u64,
+}
+
 /// The Compiled Semantic Graph (State).
 /// It consists of flat lists of typed nodes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,6 +62,7 @@ pub struct State {
     pub goals: Vec<Goal>,
     pub decisions: Vec<Decision>,
     pub resources: Vec<Resource>,
+    pub pending: Vec<Pending>,
 }
 
 impl State {
@@ -99,12 +107,52 @@ impl State {
         id
     }
 
-    /// Canonicalize the state by sorting nodes.
-    /// Note: This is simplified; real canonicalization should maintain ID stability or re-index.
+    /// Add a pending node and return its position.
+    pub fn add_pending(&mut self, text_sym: u64) -> u32 {
+        let id = self.pending.len() as u32;
+        self.pending.push(Pending { text_sym });
+        id
+    }
+
+    /// Canonicalize the state by sorting all nodes and re-mapping IDs to ensure 
+    /// that identical semantic content results in an identical byte representation.
     pub fn canonicalize(&mut self) {
         self.axioms.sort_by_key(|n| n.text_sym);
         self.resources.sort_by_key(|n| n.text_sym);
-        // Goals and Decisions have positional IDs, so sorting them requires re-indexing.
-        // For v0, we assume the encoder adds them in a stable order.
+        self.pending.sort_by_key(|n| n.text_sym);
+
+        // 1. Sort Goals by content (SymID)
+        let mut goal_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut sorted_goals = self.goals.clone();
+        // We sort by text_sym to be deterministic.
+        sorted_goals.sort_by_key(|g| g.text_sym);
+
+        for (new_id, goal) in sorted_goals.iter_mut().enumerate() {
+            goal_map.insert(goal.id, new_id as u32);
+            goal.id = new_id as u32;
+        }
+
+        // 2. Update Goal parent_ids with new mappings
+        for goal in &mut sorted_goals {
+            for pid in &mut goal.parent_ids {
+                if let Some(&new_pid) = goal_map.get(pid) {
+                    *pid = new_pid;
+                }
+            }
+            goal.parent_ids.sort();
+        }
+        self.goals = sorted_goals;
+
+        // 3. Sort Decisions and update goal_ids
+        self.decisions.sort_by_key(|d| d.text_sym);
+        for (new_id, decision) in self.decisions.iter_mut().enumerate() {
+            decision.id = new_id as u32;
+            for gid in &mut decision.goal_ids {
+                if let Some(&new_gid) = goal_map.get(gid) {
+                    *gid = new_gid;
+                }
+            }
+            decision.goal_ids.sort();
+        }
     }
 }
