@@ -2,10 +2,9 @@
 //!
 //! Displays execution tree for a Claude Code session.
 
-use crate::error::{HindsightError, Result};
-use crate::parser::parse_session;
-use crate::storage::SessionIndex;
-use crate::tui::{run as run_tui, App};
+use crate::error::Result;
+use crate::tui::router::Router;
+use crate::tui::run_router;
 
 pub fn run(session_id: String, dashboard: bool, _port: u16) -> Result<()> {
     if dashboard {
@@ -14,18 +13,7 @@ pub fn run(session_id: String, dashboard: bool, _port: u16) -> Result<()> {
         return Ok(());
     }
 
-    // Find session
-    let index = SessionIndex::new()?;
-    let session_file = index
-        .find_by_id(&session_id)?
-        .ok_or_else(|| HindsightError::SessionNotFound(session_id.clone()))?;
-
-    // Parse session
-    let session = parse_session(&session_file.path)?;
-
-    // Launch TUI
-    let mut app = App::new(session);
-    run_tui(&mut app)?;
-
-    Ok(())
+    // Launch TUI with specific session
+    let router = Router::new_with_session(session_id)?;
+    run_router(router)
 }

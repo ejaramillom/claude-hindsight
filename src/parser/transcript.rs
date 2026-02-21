@@ -104,56 +104,7 @@ pub fn parse_session(path: &Path) -> Result<Session> {
     //   thinking → text → tool_use (one or more)
     // We accumulate all blocks for a given message.id into a single node, and
     // take the last token-usage record (which has cumulative counts).
-    let mut merged: Vec<ExecutionNode> = Vec::with_capacity(raw_nodes.len());
-    let mut current_id: Option<String> = None;
-    let mut current_base: Option<ExecutionNode> = None;
-    let mut current_content: Vec<ContentBlock> = Vec::new();
-    let mut current_usage: Option<TokenUsage> = None;
-
-    for node in raw_nodes {
-        match extract_message_id(&node) {
-            Some(id) if current_id.as_deref() == Some(id) => {
-                // Same message — ACCUMULATE blocks (each line is a distinct block)
-                // and keep the last token-usage (cumulative counts)
-                let new_blocks = extract_blocks(&node);
-                if !new_blocks.is_empty() {
-                    current_content.extend(new_blocks);
-                }
-                if let Some(tu) = node.effective_token_usage() {
-                    match current_usage.as_mut() {
-                        Some(existing) => existing.merge_last(tu),
-                        None => current_usage = Some(tu.clone()),
-                    }
-                }
-            }
-            Some(id) => {
-                // New message.id — flush previous accumulator
-                if let Some(base) = current_base.take() {
-                    merged.push(finalize_sse(base, current_content, current_usage));
-                }
-                current_id = Some(id.to_string());
-                current_content = extract_blocks(&node);
-                current_usage = node.effective_token_usage().cloned();
-                current_base = Some(node);
-            }
-            None => {
-                // No message.id (tool results, progress, system) — flush and pass through
-                if let Some(base) = current_base.take() {
-                    merged.push(finalize_sse(base, current_content, current_usage));
-                    current_id = None;
-                    current_content = Vec::new();
-                    current_usage = None;
-                }
-                merged.push(node);
-            }
-        }
-    }
-    // Flush final accumulator
-    if let Some(base) = current_base.take() {
-        merged.push(finalize_sse(base, current_content, current_usage));
-    }
-
-    let merged = merged;
+    let merged_nodes = SseMerger::merge(raw_nodes);
     // ── end SSE deduplication ─────────────────────────────────────────────────
 
     // ── Progress node deduplication ───────────────────────────────────────────
@@ -161,7 +112,7 @@ pub fn parse_session(path: &Path) -> Result<Session> {
     // (agent, bash, hook). All frames for the same invocation share the same
     // `toolUseID` but differ only by uuid/timestamp. Keep only the last frame
     // per toolUseID — it has the most complete output/elapsed time.
-    let nodes = dedup_progress_nodes(merged);
+    let nodes = dedup_progress_nodes(merged_nodes);
     // ── end progress deduplication ────────────────────────────────────────────
 
     // Extract session ID from filename or first node
@@ -192,6 +143,74 @@ fn extract_session_id(path: &Path) -> Result<String> {
 }
 
 // ── SSE helpers ───────────────────────────────────────────────────────────────
+
+struct SseMerger {
+    merged: Vec<ExecutionNode>,
+    current_id: Option<String>,
+    current_base: Option<ExecutionNode>,
+    current_content: Vec<ContentBlock>,
+    current_usage: Option<TokenUsage>,
+}
+
+impl SseMerger {
+    fn new(capacity: usize) -> Self {
+        Self {
+            merged: Vec::with_capacity(capacity),
+            current_id: None,
+            current_base: None,
+            current_content: Vec::new(),
+            current_usage: None,
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some(base) = self.current_base.take() {
+            self.merged.push(finalize_sse(
+                base,
+                std::mem::take(&mut self.current_content),
+                self.current_usage.take(),
+            ));
+        }
+        self.current_id = None;
+    }
+
+    pub fn merge(raw_nodes: Vec<ExecutionNode>) -> Vec<ExecutionNode> {
+        let mut merger = Self::new(raw_nodes.len());
+
+        for node in raw_nodes {
+            match extract_message_id(&node) {
+                Some(id) if merger.current_id.as_deref() == Some(id) => {
+                    // Same message — ACCUMULATE blocks
+                    let new_blocks = extract_blocks(&node);
+                    if !new_blocks.is_empty() {
+                        merger.current_content.extend(new_blocks);
+                    }
+                    if let Some(tu) = node.effective_token_usage() {
+                        match merger.current_usage.as_mut() {
+                            Some(existing) => existing.merge_last(tu),
+                            None => merger.current_usage = Some(tu.clone()),
+                        }
+                    }
+                }
+                Some(id) => {
+                    // New message.id — flush previous accumulator
+                    merger.flush();
+                    merger.current_id = Some(id.to_string());
+                    merger.current_content = extract_blocks(&node);
+                    merger.current_usage = node.effective_token_usage().cloned();
+                    merger.current_base = Some(node);
+                }
+                None => {
+                    // No message.id — flush and pass through
+                    merger.flush();
+                    merger.merged.push(node);
+                }
+            }
+        }
+        merger.flush();
+        merger.merged
+    }
+}
 
 fn extract_message_id(node: &ExecutionNode) -> Option<&str> {
     node.message.as_ref()?.id.as_deref()

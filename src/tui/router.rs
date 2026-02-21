@@ -131,80 +131,65 @@ impl Router {
         }
 
         match &self.view_mode {
-            ViewMode::Projects => {
-                // D key opens dashboard from projects view
-                if key.code == KeyCode::Char('d') || key.code == KeyCode::Char('D') {
-                    self.navigate_to_dashboard()?;
-                    return Ok(());
-                }
-                if let Some(ref mut view) = self.projects_view {
-                    match view.handle_key(key)? {
-                        ProjectAction::None => {}
-                        ProjectAction::SelectProject(project_name) => {
-                            self.navigate_to_sessions(project_name)?;
-                        }
-                        ProjectAction::Quit => {
-                            self.should_quit = true;
-                        }
-                    }
-                }
-            }
+            ViewMode::Projects => self.handle_projects_key(key),
+            ViewMode::Dashboard => self.handle_dashboard_key(key),
+            ViewMode::Sessions(_) => self.handle_sessions_key(key),
+            ViewMode::SessionDetail(_) => self.handle_session_detail_key(key),
+        }
+    }
 
-            ViewMode::Dashboard => {
-                if let Some(ref mut view) = self.dashboard_view {
-                    match view.handle_key(key)? {
-                        DashboardAction::None => {}
-                        DashboardAction::Back => {
-                            self.navigate_back()?;
-                        }
-                        DashboardAction::Quit => {
-                            self.should_quit = true;
-                        }
-                    }
-                }
-            }
-
-            ViewMode::Sessions(_) => {
-                if let Some(ref mut view) = self.sessions_view {
-                    match view.handle_key(key)? {
-                        SessionAction::None => {}
-                        SessionAction::SelectSession(session_id) => {
-                            self.navigate_to_session_detail(session_id)?;
-                        }
-                        SessionAction::Back => {
-                            self.navigate_back()?;
-                        }
-                        SessionAction::Quit => {
-                            self.should_quit = true;
-                        }
-                    }
-                }
-            }
-
-            ViewMode::SessionDetail(_) => {
-                let (should_go_back, should_quit) =
-                    if let Some(ref mut view) = self.session_detail_view {
-                        view.handle_key(key)?;
-                        (
-                            view.should_quit && !self.view_stack.is_empty(),
-                            view.should_quit && self.view_stack.is_empty(),
-                        )
-                    } else {
-                        (false, false)
-                    };
-
-                if should_go_back {
-                    self.navigate_back()?;
-                    // Reset quit flag
-                    if let Some(ref mut view) = self.session_detail_view {
-                        view.should_quit = false;
-                    }
-                } else if should_quit {
-                    self.should_quit = true;
-                }
-            }
+    fn handle_projects_key(&mut self, key: KeyEvent) -> Result<()> {
+        // D key opens dashboard from projects view
+        if matches!(key.code, KeyCode::Char('d' | 'D')) {
+            return self.navigate_to_dashboard();
         }
 
+        if let Some(ref mut view) = self.projects_view {
+            match view.handle_key(key)? {
+                ProjectAction::None => {}
+                ProjectAction::SelectProject(name) => self.navigate_to_sessions(name)?,
+                ProjectAction::Quit => self.should_quit = true,
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_dashboard_key(&mut self, key: KeyEvent) -> Result<()> {
+        if let Some(ref mut view) = self.dashboard_view {
+            match view.handle_key(key)? {
+                DashboardAction::None => {}
+                DashboardAction::Back => self.navigate_back()?,
+                DashboardAction::Quit => self.should_quit = true,
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_sessions_key(&mut self, key: KeyEvent) -> Result<()> {
+        if let Some(ref mut view) = self.sessions_view {
+            match view.handle_key(key)? {
+                SessionAction::None => {}
+                SessionAction::SelectSession(id) => self.navigate_to_session_detail(id)?,
+                SessionAction::Back => self.navigate_back()?,
+                SessionAction::Quit => self.should_quit = true,
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_session_detail_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(ref mut view) = self.session_detail_view else { return Ok(()); };
+        
+        view.handle_key(key)?;
+        
+        if view.should_quit {
+            if self.view_stack.is_empty() {
+                self.should_quit = true;
+            } else {
+                view.should_quit = false; // Reset view's local quit flag
+                self.navigate_back()?;
+            }
+        }
         Ok(())
     }
 
@@ -322,34 +307,40 @@ impl Router {
 
     /// Render the current view
     pub fn render(&mut self, f: &mut Frame) {
-        // Render the main view
+        let area = f.area();
+        
         match &self.view_mode {
-            ViewMode::Projects => {
-                if let Some(ref mut view) = self.projects_view {
-                    view.render(f, f.area());
-                }
-            }
-
-            ViewMode::Dashboard => {
-                if let Some(ref view) = self.dashboard_view {
-                    view.render(f, f.area());
-                }
-            }
-
-            ViewMode::Sessions(_) => {
-                if let Some(ref mut view) = self.sessions_view {
-                    view.render(f, f.area());
-                }
-            }
-
-            ViewMode::SessionDetail(_) => {
-                if let Some(ref mut view) = self.session_detail_view {
-                    crate::tui::ui::draw(f, view);
-                }
-            }
+            ViewMode::Projects => self.render_projects(f, area),
+            ViewMode::Dashboard => self.render_dashboard(f, area),
+            ViewMode::Sessions(_) => self.render_sessions(f, area),
+            ViewMode::SessionDetail(_) => self.render_session_detail(f),
         }
 
         // Render search modal as overlay (if active)
-        self.search_modal.render(f, f.area());
+        self.search_modal.render(f, area);
+    }
+
+    fn render_projects(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        if let Some(ref mut view) = self.projects_view {
+            view.render(f, area);
+        }
+    }
+
+    fn render_dashboard(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        if let Some(ref view) = self.dashboard_view {
+            view.render(f, area);
+        }
+    }
+
+    fn render_sessions(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        if let Some(ref mut view) = self.sessions_view {
+            view.render(f, area);
+        }
+    }
+
+    fn render_session_detail(&mut self, f: &mut Frame) {
+        if let Some(ref mut view) = self.session_detail_view {
+            crate::tui::ui::draw(f, view);
+        }
     }
 }

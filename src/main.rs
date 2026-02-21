@@ -331,41 +331,17 @@ fn run() -> Result<()> {
 /// Run the main TUI hub
 fn run_hub() -> Result<()> {
     use tui::router::Router;
-    use tui::EventHandler;
+    use tui::run_router;
 
-    // Initialize router
-    let mut router = Router::new()?;
-
-    // Initialize terminal
-    let mut terminal = tui::init()?;
-    let mut event_handler = EventHandler::new(250);
-
-    // Main loop
-    loop {
-        terminal.draw(|f| router.render(f))?;
-
-        if let tui::Event::Key(key) = event_handler.poll()? {
-            router.handle_key(key)?;
-        }
-
-        // Process periodic updates (debounced search, etc.)
-        router.tick();
-
-        if router.should_quit {
-            break;
-        }
-    }
-
-    // Restore terminal
-    tui::restore()?;
-    Ok(())
+    let router = Router::new()?;
+    run_router(router)
 }
 
 /// Run the TUI opening the most recent session
 fn run_last_session() -> Result<()> {
     use storage::SessionIndex;
     use tui::router::Router;
-    use tui::EventHandler;
+    use tui::run_router;
 
     // Get the most recent session
     let index = SessionIndex::new()?;
@@ -373,32 +349,8 @@ fn run_last_session() -> Result<()> {
 
     match latest {
         Some(session_file) => {
-            // Create router with the session
-            let mut router = Router::new_with_session(session_file.session_id)?;
-
-            // Initialize terminal
-            let mut terminal = tui::init()?;
-            let mut event_handler = EventHandler::new(250);
-
-            // Main loop
-            loop {
-                terminal.draw(|f| router.render(f))?;
-
-                if let tui::Event::Key(key) = event_handler.poll()? {
-                    router.handle_key(key)?;
-                }
-
-                // Process periodic updates (debounced search, etc.)
-                router.tick();
-
-                if router.should_quit {
-                    break;
-                }
-            }
-
-            // Restore terminal
-            tui::restore()?;
-            Ok(())
+            let router = Router::new_with_session(session_file.session_id)?;
+            run_router(router)
         }
         None => {
             eprintln!("No sessions found. Run 'hindsight init' to discover sessions.");

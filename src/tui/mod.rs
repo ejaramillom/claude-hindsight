@@ -43,7 +43,30 @@ pub fn restore() -> Result<()> {
     Ok(())
 }
 
-/// Run the TUI application
+/// Run the TUI with a Router
+pub fn run_router(mut router: router::Router) -> Result<()> {
+    let mut terminal = init()?;
+    let mut event_handler = EventHandler::new(250);
+
+    loop {
+        terminal.draw(|f| router.render(f))?;
+
+        if let Event::Key(key) = event_handler.poll()? {
+            router.handle_key(key)?;
+        }
+
+        router.tick();
+
+        if router.should_quit {
+            break;
+        }
+    }
+
+    restore()?;
+    Ok(())
+}
+
+/// Run the TUI application (Legacy App struct)
 pub fn run(app: &mut App) -> Result<()> {
     let mut terminal = init()?;
     let mut event_handler = EventHandler::new(250);

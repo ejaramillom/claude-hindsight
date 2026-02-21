@@ -58,14 +58,29 @@ pub struct SessionFile {
 ///
 /// Returns `HindsightError::NoSessionsFound` if no sessions are discovered.
 pub fn discover_sessions() -> Result<Vec<SessionFile>> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| HindsightError::Config("Could not determine home directory".to_string()))?;
-
     let config = crate::config::Config::load().unwrap_or_default();
+    let claude_dirs = resolve_claude_dirs(&config);
 
-    // Resolve configured directories: expand ~ and filter to those that exist.
-    // Each entry carries (expanded_path, raw_config_path) for source_dir tracking.
-    let claude_dirs: Vec<(PathBuf, String)> = config
+    let mut sessions = Vec::new();
+    for (expanded_path, source_dir) in claude_dirs {
+        let mut dir_sessions = scan_claude_dir(&expanded_path, &source_dir)?;
+        sessions.append(&mut dir_sessions);
+    }
+
+    if sessions.is_empty() {
+        return Err(HindsightError::NoSessionsFound);
+    }
+
+    // Sort by modification time (newest first)
+    sessions.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+
+    Ok(sessions)
+}
+
+/// Resolve configured directories: expand ~ and filter to those that exist.
+fn resolve_claude_dirs(config: &crate::config::Config) -> Vec<(PathBuf, String)> {
+    let home = dirs::home_dir().unwrap_or_default();
+    config
         .paths
         .claude_dirs
         .iter()
@@ -78,80 +93,78 @@ pub fn discover_sessions() -> Result<Vec<SessionFile>> {
             (expanded, d.path.clone())
         })
         .filter(|(p, _)| p.exists())
-        .collect();
+        .collect()
+}
 
+/// Scan a top-level Claude projects directory for all session files.
+fn scan_claude_dir(claude_dir: &Path, source_dir: &str) -> Result<Vec<SessionFile>> {
     let mut sessions = Vec::new();
-
-    for (claude_dir, source_dir) in &claude_dirs {
-        if !claude_dir.exists() {
+    for project_entry in fs::read_dir(claude_dir)? {
+        let project_path = project_entry?.path();
+        if !project_path.is_dir() {
             continue;
         }
 
-        // Scan each project directory
-        for project_entry in fs::read_dir(claude_dir)? {
-            let project_entry = project_entry?;
-            let project_path = project_entry.path();
+        let project_name = decode_project_name(&project_path);
+        let mut project_sessions = scan_project_dir(&project_path, &project_name, source_dir)?;
+        sessions.append(&mut project_sessions);
+    }
+    Ok(sessions)
+}
 
-            if !project_path.is_dir() {
-                continue;
-            }
+/// Scan a specific project directory for .jsonl session files.
+fn scan_project_dir(project_path: &Path, project_name: &str, source_dir: &str) -> Result<Vec<SessionFile>> {
+    let mut sessions = Vec::new();
+    for file_entry in fs::read_dir(project_path)? {
+        let file_path = file_entry?.path();
 
-            // Extract project name from directory name
-            let project_name = decode_project_name(&project_path);
-
-            // Find all .jsonl files in this project
-            for file_entry in fs::read_dir(&project_path)? {
-                let file_entry = file_entry?;
-                let file_path = file_entry.path();
-
-                // Check if it's a .jsonl file (not a directory)
-                if file_path.is_file()
-                    && file_path.extension().and_then(|s| s.to_str()) == Some("jsonl")
-                {
-                    let metadata = fs::metadata(&file_path)?;
-                    let session_id = file_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    let modified_at = metadata
-                        .modified()?
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-
-                    // Check if there's a matching directory with subagents
-                    let subagents_dir = project_path.join(&session_id).join("subagents");
-                    let has_subagents = subagents_dir.exists() && subagents_dir.is_dir();
-
-                    sessions.push(SessionFile {
-                        path: file_path,
-                        session_id,
-                        project_name: project_name.clone(),
-                        file_size: metadata.len(),
-                        created_at: modified_at, // refined during indexing from first node timestamp
-                        modified_at,
-                        has_subagents,
-                        model: None,
-                        error_count: 0,
-                        first_message: None,
-                        source_dir: source_dir.clone(),
-                        subagent_models: None,
-                    });
-                }
+        if is_session_file(&file_path) {
+            if let Ok(session) = build_session_file(&file_path, project_name, source_dir) {
+                sessions.push(session);
             }
         }
     }
-
-    if sessions.is_empty() {
-        return Err(HindsightError::NoSessionsFound);
-    }
-
-    // Sort by modification time (newest first)
-    sessions.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
-
     Ok(sessions)
+}
+
+/// Check if a path points to a Claude session JSONL file.
+fn is_session_file(path: &Path) -> bool {
+    path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+}
+
+/// Build a SessionFile struct from a path and metadata.
+fn build_session_file(path: &Path, project_name: &str, source_dir: &str) -> Result<SessionFile> {
+    let metadata = fs::metadata(path)?;
+    let session_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let modified_at = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // Check if there's a matching directory with subagents
+    let subagents_dir = path.parent().unwrap().join(&session_id).join("subagents");
+    let has_subagents = subagents_dir.exists() && subagents_dir.is_dir();
+
+    Ok(SessionFile {
+        path: path.to_path_buf(),
+        session_id,
+        project_name: project_name.to_string(),
+        file_size: metadata.len(),
+        created_at: modified_at,
+        modified_at,
+        has_subagents,
+        model: None,
+        error_count: 0,
+        first_message: None,
+        source_dir: source_dir.to_string(),
+        subagent_models: None,
+    })
 }
 
 /// Decode project name from directory path

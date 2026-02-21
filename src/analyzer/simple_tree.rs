@@ -9,42 +9,19 @@ use std::rc::Rc;
 
 /// Deduplicate consecutive progress nodes (especially agent progress)
 fn deduplicate_progress(nodes: Vec<ExecutionNode>) -> Vec<ExecutionNode> {
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(nodes.len());
     let mut last_agent_id: Option<String> = None;
-    let mut skip_count = 0;
 
     for node in nodes {
-        // Check if this is agent progress
-        if node.node_type == "progress" {
-            if let Some(data) = node.extra.as_ref().and_then(|e| e.get("data")) {
-                if let Some(progress_type) = data.get("type").and_then(|t| t.as_str()) {
-                    if progress_type == "agent_progress" {
-                        if let Some(agent_id) = data.get("agentId").and_then(|a| a.as_str()) {
-                            // If same agent as last progress, skip it
-                            if last_agent_id.as_deref() == Some(agent_id) {
-                                skip_count += 1;
-                                continue;
-                            } else {
-                                // Different agent, update tracker
-                                if skip_count > 0 {
-                                    // Add a summary node showing how many were skipped
-                                    // (we'll just reset the counter for now)
-                                    skip_count = 0;
-                                }
-                                last_agent_id = Some(agent_id.to_string());
-                            }
-                        }
-                    } else {
-                        // Not agent progress, reset tracker
-                        last_agent_id = None;
-                        skip_count = 0;
-                    }
-                }
+        // If it's a progress node with the same agent as before, skip it
+        if let Some(agent_id) = node.agent_id() {
+            if last_agent_id.as_deref() == Some(agent_id) {
+                continue;
             }
+            last_agent_id = Some(agent_id.to_string());
         } else {
-            // Not a progress node, reset tracker
+            // Not a progress node or different agent type — reset tracker
             last_agent_id = None;
-            skip_count = 0;
         }
 
         result.push(node);

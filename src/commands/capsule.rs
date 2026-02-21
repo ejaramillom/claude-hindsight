@@ -24,70 +24,17 @@ pub fn create(session_id: String, output: String) -> Result<()> {
 
     // Heuristic Mapping
     for node in &session.nodes {
-        if node.node_type == "user" {
-            if let Some(msg) = &node.message {
-                let text = msg.text_content();
-                if !text.is_empty() {
-                    // Axiom Detection: Look for definitive project-wide constraints
-                    if text.starts_with("Always") || text.starts_with("Never") || text.contains("Language:") {
-                         let sym = capsule.symtable.intern(&text, SymCategory::Tag);
-                         capsule.state.add_axiom(sym);
-                    } else {
-                        // Default to Goal
-                        let sym = capsule.symtable.intern(&text, SymCategory::Literal);
-                        active_goal_id = Some(capsule.state.add_goal(sym, GoalStatus::Open));
-                    }
-                }
+        match node.node_type.as_str() {
+            "user" => {
+                active_goal_id = map_user_node(&mut capsule, node);
             }
-        } else if node.node_type == "assistant" {
-            if let Some(msg) = &node.message {
-                // 1. Thinking Extraction
-                if let Some(thinking) = &node.thinking {
-                    if !thinking.is_empty() {
-                        let sym = capsule.symtable.intern(&format!("[Reasoning] {}", thinking), SymCategory::Literal);
-                        let did = capsule.state.add_decision(sym);
-                        if let Some(gid) = active_goal_id {
-                            if let Some(decision) = capsule.state.decisions.get_mut(did as usize) {
-                                decision.goal_ids.push(gid);
-                            }
-                        }
-                    }
-                }
-
-                // 2. Decision Extraction
-                let text = msg.text_content();
-                if !text.is_empty() {
-                    let sym = capsule.symtable.intern(&text, SymCategory::Literal);
-                    let did = capsule.state.add_decision(sym);
-                    if let Some(gid) = active_goal_id {
-                        if let Some(decision) = capsule.state.decisions.get_mut(did as usize) {
-                            decision.goal_ids.push(gid);
-                        }
-
-                        // Heuristic Goal Completion
-                        let lower_text = text.to_lowercase();
-                        if lower_text.contains("done") || lower_text.contains("finished") || lower_text.contains("implemented") {
-                            if let Some(goal) = capsule.state.goals.get_mut(gid as usize) {
-                                goal.status = GoalStatus::Completed;
-                            }
-                        }
-                    }
-
-                    // 3. Pending Extraction (Questions or "Next Steps")
-                    if text.contains("?") || text.contains("Next step") || text.contains("follow-up") {
-                        // Extract the specific question/step if possible, or just the whole text for now
-                        let sym = capsule.symtable.intern(&text, SymCategory::Literal);
-                        capsule.state.add_pending(sym);
-                    }
-                }
+            "assistant" => {
+                map_assistant_node(&mut capsule, node, active_goal_id);
             }
-        } else if node.node_type == "tool_use" {
-            if let Some(tool) = &node.tool_use {
-                if let Some(file_path) = tool.input.get("file_path").and_then(|v| v.as_str()) {
-                    let sym = capsule.symtable.intern(file_path, SymCategory::Resource);
-                    capsule.state.add_resource(sym);
-                }
+            "tool_use" => {
+                map_tool_use_node(&mut capsule, node);
             }
+            _ => {}
         }
     }
 
@@ -110,6 +57,77 @@ pub fn create(session_id: String, output: String) -> Result<()> {
         capsule.state.pending.len());
     
     Ok(())
+}
+
+fn map_user_node(capsule: &mut Capsule, node: &crate::parser::ExecutionNode) -> Option<u32> {
+    let msg = node.message.as_ref()?;
+    let text = msg.text_content();
+    if text.is_empty() { return None; }
+
+    // Axiom Detection: Look for definitive project-wide constraints
+    if text.starts_with("Always") || text.starts_with("Never") || text.contains("Language:") {
+        let sym = capsule.symtable.intern(&text, SymCategory::Tag);
+        capsule.state.add_axiom(sym);
+        None
+    } else {
+        // Default to Goal
+        let sym = capsule.symtable.intern(&text, SymCategory::Literal);
+        Some(capsule.state.add_goal(sym, GoalStatus::Open))
+    }
+}
+
+fn map_assistant_node(capsule: &mut Capsule, node: &crate::parser::ExecutionNode, active_goal_id: Option<u32>) {
+    let msg = node.message.as_ref();
+    
+    // 1. Thinking Extraction
+    if let Some(thinking) = &node.thinking {
+        if !thinking.is_empty() {
+            let sym = capsule.symtable.intern(&format!("[Reasoning] {}", thinking), SymCategory::Literal);
+            let did = capsule.state.add_decision(sym);
+            if let Some(gid) = active_goal_id {
+                if let Some(decision) = capsule.state.decisions.get_mut(did as usize) {
+                    decision.goal_ids.push(gid);
+                }
+            }
+        }
+    }
+
+    let Some(m) = msg else { return; };
+    let text = m.text_content();
+    if text.is_empty() { return; }
+
+    // 2. Decision Extraction
+    let sym = capsule.symtable.intern(&text, SymCategory::Literal);
+    let did = capsule.state.add_decision(sym);
+    
+    if let Some(gid) = active_goal_id {
+        if let Some(decision) = capsule.state.decisions.get_mut(did as usize) {
+            decision.goal_ids.push(gid);
+        }
+
+        // Heuristic Goal Completion
+        let lower_text = text.to_lowercase();
+        if lower_text.contains("done") || lower_text.contains("finished") || lower_text.contains("implemented") {
+            if let Some(goal) = capsule.state.goals.get_mut(gid as usize) {
+                goal.status = GoalStatus::Completed;
+            }
+        }
+    }
+
+    // 3. Pending Extraction (Questions or "Next Steps")
+    if text.contains("?") || text.contains("Next step") || text.contains("follow-up") {
+        let sym = capsule.symtable.intern(&text, SymCategory::Literal);
+        capsule.state.add_pending(sym);
+    }
+}
+
+fn map_tool_use_node(capsule: &mut Capsule, node: &crate::parser::ExecutionNode) {
+    if let Some(tool) = &node.tool_use {
+        if let Some(file_path) = tool.input.get("file_path").and_then(|v| v.as_str()) {
+            let sym = capsule.symtable.intern(file_path, SymCategory::Resource);
+            capsule.state.add_resource(sym);
+        }
+    }
 }
 
 pub fn hydrate(path: String) -> Result<()> {

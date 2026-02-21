@@ -62,28 +62,12 @@ impl SessionAnalytics {
             *node_counts.entry(node.node_type.clone()).or_insert(0) += 1;
 
             // Check for subagents
-            if let Some(extra) = node.extra.as_ref().and_then(|e| e.get("isSidechain")) {
-                if let Some(is_sidechain) = extra.as_bool() {
-                    if is_sidechain {
-                        has_subagents = true;
-                    }
-                }
+            if node.is_subagent() {
+                has_subagents = true;
             }
 
-            // Count thinking blocks using typed ContentBlock matching
-            let has_thinking = node.thinking.is_some()
-                || node.node_type == "thinking"
-                || node
-                    .message
-                    .as_ref()
-                    .map(|m| {
-                        m.content_blocks()
-                            .iter()
-                            .any(|b| matches!(b, ContentBlock::Thinking { .. }))
-                    })
-                    .unwrap_or(false);
-
-            if has_thinking {
+            // Count thinking blocks
+            if node.is_thinking() {
                 thinking_count += 1;
             }
 
@@ -105,54 +89,11 @@ impl SessionAnalytics {
                 }
             }
 
-            // Count errors — aligned with Session::new comprehensive detection
-            if node.node_type == "error" {
+            // Count errors
+            if node.node_type == "error" || node.is_error() {
                 error_count += 1;
-            }
-
-            {
-                let tr = node.tool_result.as_ref();
-                let tool_result_error = tr.and_then(|r| r.is_error).unwrap_or(false);
-                let content_tag_error = tr
-                    .and_then(|r| r.content.as_deref())
-                    .map(|c| c.contains("<tool_use_error>"))
-                    .unwrap_or(false);
-
-                let tool_use_result_error = node
-                    .tool_use_result
-                    .as_ref()
-                    .and_then(|v| {
-                        serde_json::from_value::<crate::parser::models::ToolResult>(v.clone())
-                            .ok()
-                            .and_then(|r| r.is_error)
-                    })
-                    .unwrap_or(false);
-
-                let block_error = node
-                    .message
-                    .as_ref()
-                    .map(|m| {
-                        m.content_blocks().iter().any(|b| match b {
-                            ContentBlock::ToolResult {
-                                content, is_error, ..
-                            } => {
-                                is_error.unwrap_or(false)
-                                    || content
-                                        .as_ref()
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.contains("<tool_use_error>"))
-                                        .unwrap_or(false)
-                            }
-                            _ => false,
-                        })
-                    })
-                    .unwrap_or(false);
-
-                if tool_result_error || content_tag_error || tool_use_result_error || block_error {
-                    error_count += 1;
-                    if tool_result_error {
-                        tool_result_error_count += 1;
-                    }
+                if node.tool_result.as_ref().and_then(|r| r.is_error).unwrap_or(false) {
+                    tool_result_error_count += 1;
                 }
             }
 

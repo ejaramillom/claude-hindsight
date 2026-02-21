@@ -131,6 +131,86 @@ impl ExecutionNode {
             .as_ref()
             .or_else(|| self.message.as_ref().and_then(|m| m.usage.as_ref()))
     }
+
+    /// Returns true if this node represents an error (e.g., failed tool call).
+    pub fn is_error(&self) -> bool {
+        let tr = self.tool_result.as_ref();
+        let tool_result_error = tr.and_then(|r| r.is_error).unwrap_or(false);
+        let content_tag_error = tr
+            .and_then(|r| r.content.as_deref())
+            .map(|c| c.contains("<tool_use_error>"))
+            .unwrap_or(false);
+
+        let tool_use_result_error = self
+            .tool_use_result
+            .as_ref()
+            .and_then(|v| {
+                // Heuristic: check if the tool_use_result field itself is an error object
+                serde_json::from_value::<ToolResult>(v.clone())
+                    .ok()
+                    .and_then(|r| r.is_error)
+            })
+            .unwrap_or(false);
+
+        // Also check message content blocks for tool_result errors
+        let block_error = self
+            .message
+            .as_ref()
+            .map(|m| {
+                m.content_blocks().iter().any(|b| match b {
+                    ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } => {
+                        is_error.unwrap_or(false)
+                            || content
+                                .as_ref()
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.contains("<tool_use_error>"))
+                                .unwrap_or(false)
+                    }
+                    _ => false,
+                })
+            })
+            .unwrap_or(false);
+
+        tool_result_error || content_tag_error || tool_use_result_error || block_error
+    }
+
+    /// Returns true if this node represents a thinking block.
+    pub fn is_thinking(&self) -> bool {
+        self.thinking.is_some()
+            || self.node_type == "thinking"
+            || self
+                .message
+                .as_ref()
+                .map(|m| {
+                    m.content_blocks()
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Thinking { .. }))
+                })
+                .unwrap_or(false)
+    }
+
+    /// Returns true if this node belongs to a subagent (sidechain).
+    pub fn is_subagent(&self) -> bool {
+        self.extra
+            .as_ref()
+            .and_then(|e| e.get("isSidechain"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Returns the agent ID for a progress node, if applicable.
+    pub fn agent_id(&self) -> Option<&str> {
+        if self.node_type != "progress" {
+            return None;
+        }
+        self.extra
+            .as_ref()
+            .and_then(|e| e.get("data"))
+            .and_then(|d| d.get("agentId"))
+            .and_then(|a| a.as_str())
+    }
 }
 
 /// Message content (user or assistant)
@@ -396,50 +476,7 @@ impl Session {
     pub fn new(session_id: String, file_path: Option<String>, nodes: Vec<ExecutionNode>) -> Self {
         let total_tools = nodes.iter().filter(|n| n.tool_use.is_some()).count();
 
-        let error_count = nodes
-            .iter()
-            .filter(|n| {
-                let tr = n.tool_result.as_ref();
-                let tool_result_error = tr.and_then(|r| r.is_error).unwrap_or(false);
-                let content_tag_error = tr
-                    .and_then(|r| r.content.as_deref())
-                    .map(|c| c.contains("<tool_use_error>"))
-                    .unwrap_or(false);
-
-                let tool_use_result_error = n
-                    .tool_use_result
-                    .as_ref()
-                    .and_then(|v| {
-                        serde_json::from_value::<ToolResult>(v.clone())
-                            .ok()
-                            .and_then(|r| r.is_error)
-                    })
-                    .unwrap_or(false);
-
-                // Also check message content blocks for tool_result errors
-                let block_error = n
-                    .message
-                    .as_ref()
-                    .map(|m| {
-                        m.content_blocks().iter().any(|b| match b {
-                            ContentBlock::ToolResult {
-                                content, is_error, ..
-                            } => {
-                                is_error.unwrap_or(false)
-                                    || content
-                                        .as_ref()
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.contains("<tool_use_error>"))
-                                        .unwrap_or(false)
-                            }
-                            _ => false,
-                        })
-                    })
-                    .unwrap_or(false);
-
-                tool_result_error || content_tag_error || tool_use_result_error || block_error
-            })
-            .count();
+        let error_count = nodes.iter().filter(|n| n.is_error()).count();
 
         let start_time = nodes.iter().filter_map(|n| n.timestamp).min();
         let end_time = nodes.iter().filter_map(|n| n.timestamp).max();

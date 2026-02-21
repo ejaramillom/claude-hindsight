@@ -136,159 +136,21 @@ impl App {
     /// Create a new app from a session
     pub fn new(session: Session) -> Self {
         let total_nodes = session.nodes.len();
-
-        // Calculate session analytics
         let analytics = SessionAnalytics::from_session(&session);
-
-        // Build tool correlation map: tool_use_id → tool_name
-        let mut tool_correlation: HashMap<String, String> = HashMap::new();
-        for node in &session.nodes {
-            if let Some(ref msg) = node.message {
-                for block in msg.content_blocks() {
-                    if let ContentBlock::ToolUse { id, name, .. } = block {
-                        tool_correlation.insert(id.clone(), name.clone());
-                    }
-                }
-            }
-        }
-
-        // Build tool result map: tool_use_id → brief summary
-        let mut tool_result_map: HashMap<String, String> = HashMap::new();
-        for node in &session.nodes {
-            // Path 1: ToolResult content blocks inside user messages
-            if let Some(ref msg) = node.message {
-                for block in msg.content_blocks() {
-                    if let ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } = block
-                    {
-                        let is_err = is_error.unwrap_or(false);
-                        let prefix = if is_err { "✗" } else { "✓" };
-                        let text = content.as_ref().and_then(|v| {
-                            if let Some(s) = v.as_str() {
-                                Some(s.to_string())
-                            } else if let Some(arr) = v.as_array() {
-                                arr.iter()
-                                    .find_map(|b| b.get("text").and_then(|t| t.as_str()))
-                                    .map(str::to_string)
-                            } else {
-                                None
-                            }
-                        });
-                        let summary = match text.as_deref() {
-                            None | Some("") => format!("{} ok", prefix),
-                            Some(t) => {
-                                let lines = t.lines().count();
-                                let first = t.lines().next().unwrap_or("").trim();
-                                let short: String = first.chars().take(60).collect();
-                                if lines > 1 {
-                                    format!("{} {} ({} lines)", prefix, short, lines)
-                                } else {
-                                    format!("{} {}", prefix, short)
-                                }
-                            }
-                        };
-                        tool_result_map.insert(tool_use_id.clone(), summary);
-                    }
-                }
-            }
-            // Path 2: top-level tool_result field
-            if let Some(ref result) = node.tool_result {
-                if let Some(ref id) = result.tool_use_id {
-                    let summary = if result.is_error == Some(true) {
-                        let err = result
-                            .error
-                            .as_deref()
-                            .or(result.content.as_deref())
-                            .unwrap_or("error");
-                        let first = err.lines().next().unwrap_or("").trim();
-                        format!("✗ {}", &first.chars().take(60).collect::<String>())
-                    } else if let Some(ref file) = result.file {
-                        let name = file
-                            .file_path
-                            .as_deref()
-                            .and_then(|p| p.rsplit('/').next())
-                            .unwrap_or("file");
-                        let lines = file
-                            .content
-                            .as_deref()
-                            .map(|c| c.lines().count())
-                            .unwrap_or(0);
-                        if lines > 0 {
-                            format!("✓ {} ({} lines)", name, lines)
-                        } else {
-                            format!("✓ {}", name)
-                        }
-                    } else if let Some(ref content) = result.content {
-                        let lines = content.lines().count();
-                        let first = content.lines().next().unwrap_or("").trim();
-                        let short: String = first.chars().take(60).collect();
-                        if lines > 1 {
-                            format!("✓ {} ({} lines)", short, lines)
-                        } else {
-                            format!("✓ {}", short)
-                        }
-                    } else {
-                        "✓ ok".to_string()
-                    };
-                    tool_result_map.insert(id.clone(), summary);
-                }
-            }
-        }
-
-        // Build simple hierarchical tree from parent_uuid relationships
+        let tool_correlation = Self::build_tool_correlation(&session);
+        let tool_result_map = Self::build_tool_result_map(&session);
         let tree_roots = build_simple_tree(session.nodes.clone());
 
-        // Build UUID-to-node mapping for fast lookup
         let mut uuid_to_node = HashMap::new();
         for root in &tree_roots {
             collect_uuid_mapping(root, &mut uuid_to_node);
         }
 
-        // Build tree items for tui-tree-widget (using UUIDs as identifiers)
         let tree_items = build_tree_items(&tree_roots, &None, &tool_correlation);
-
         let mut tree_state = tui_tree_widget::TreeState::default();
         tree_state.select_first();
 
-        // ── #7 / #14: collect error nodes ───────────────────────────────
-        let (error_node_uuids, error_nodes_info) = {
-            let mut uuids = vec![];
-            let mut info = vec![];
-            for node in &session.nodes {
-                let is_err = node.node_type == "error"
-                    || node
-                        .tool_result
-                        .as_ref()
-                        .map(|r| r.is_error == Some(true))
-                        .unwrap_or(false);
-                if is_err {
-                    if let Some(ref uuid) = node.uuid {
-                        let desc: String = if node.node_type == "error" {
-                            node.extra
-                                .as_ref()
-                                .and_then(|e| e.get("error"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Unknown error")
-                                .chars()
-                                .take(50)
-                                .collect()
-                        } else {
-                            node.tool_result
-                                .as_ref()
-                                .and_then(|r| r.error.as_ref())
-                                .map(|e| e.chars().take(50).collect::<String>())
-                                .unwrap_or_else(|| "Tool error".to_string())
-                        };
-                        uuids.push(uuid.clone());
-                        info.push((uuid.clone(), node.node_type.clone(), desc));
-                    }
-                }
-            }
-            (uuids, info)
-        };
+        let (error_node_uuids, error_nodes_info) = Self::collect_error_nodes(&session);
 
         App {
             session,
@@ -321,9 +183,96 @@ impl App {
         }
     }
 
-    // ── #7: Error navigation ─────────────────────────────────────────────
+    fn build_tool_correlation(session: &Session) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        for node in &session.nodes {
+            if let Some(ref msg) = node.message {
+                for block in msg.content_blocks() {
+                    if let ContentBlock::ToolUse { id, name, .. } = block {
+                        map.insert(id.clone(), name.clone());
+                    }
+                }
+            }
+        }
+        map
+    }
 
-    /// Jump to the next error node in the session
+    fn build_tool_result_map(session: &Session) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        for node in &session.nodes {
+            if let Some(ref msg) = node.message {
+                for block in msg.content_blocks() {
+                    if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
+                        let is_err = is_error.unwrap_or(false);
+                        let prefix = if is_err { "✗" } else { "✓" };
+                        let text = content.as_ref().and_then(|v| {
+                            v.as_str().map(|s| s.to_string())
+                                .or_else(|| v.as_array().and_then(|arr| arr.iter().find_map(|b| b.get("text").and_then(|t| t.as_str())).map(str::to_string)))
+                        });
+                        let summary = match text.as_deref() {
+                            None | Some("") => format!("{} ok", prefix),
+                            Some(t) => {
+                                let lines = t.lines().count();
+                                let first = t.lines().next().unwrap_or("").trim();
+                                let short: String = first.chars().take(60).collect();
+                                if lines > 1 { format!("{} {} ({} lines)", prefix, short, lines) } else { format!("{} {}", prefix, short) }
+                            }
+                        };
+                        map.insert(tool_use_id.clone(), summary);
+                    }
+                }
+            }
+            if let Some(ref result) = node.tool_result {
+                if let Some(ref id) = result.tool_use_id {
+                    let summary = if result.is_error == Some(true) {
+                        let err = result.error.as_deref().or(result.content.as_deref()).unwrap_or("error");
+                        let first = err.lines().next().unwrap_or("").trim();
+                        format!("✗ {}", &first.chars().take(60).collect::<String>())
+                    } else if let Some(ref file) = result.file {
+                        let name = file.file_path.as_deref().and_then(|p| p.rsplit('/').next()).unwrap_or("file");
+                        let lines = file.content.as_deref().map(|c| c.lines().count()).unwrap_or(0);
+                        if lines > 0 { format!("✓ {} ({} lines)", name, lines) } else { format!("✓ {}", name) }
+                    } else if let Some(ref content) = result.content {
+                        let lines = content.lines().count();
+                        let first = content.lines().next().unwrap_or("").trim();
+                        let short: String = first.chars().take(60).collect();
+                        if lines > 1 { format!("✓ {} ({} lines)", short, lines) } else { format!("✓ {}", short) }
+                    } else {
+                        "✓ ok".to_string()
+                    };
+                    map.insert(id.clone(), summary);
+                }
+            }
+        }
+        map
+    }
+
+    fn collect_error_nodes(session: &Session) -> (Vec<String>, Vec<(String, String, String)>) {
+        let mut uuids = vec![];
+        let mut info = vec![];
+        for node in &session.nodes {
+            if node.is_error() {
+                if let Some(ref uuid) = node.uuid {
+                    let desc: String = if node.node_type == "error" {
+                        node.extra.as_ref()
+                            .and_then(|e| e.get("error"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Unknown error")
+                            .chars().take(50).collect()
+                    } else {
+                        node.tool_result.as_ref()
+                            .and_then(|r| r.error.as_ref())
+                            .map(|e| e.chars().take(50).collect::<String>())
+                            .unwrap_or_else(|| "Tool error".to_string())
+                    };
+                    uuids.push(uuid.clone());
+                    info.push((uuid.clone(), node.node_type.clone(), desc));
+                }
+            }
+        }
+        (uuids, info)
+    }
+
     pub fn jump_to_next_error(&mut self) {
         if self.error_node_uuids.is_empty() {
             self.status_message = "No errors in this session".to_string();
@@ -333,14 +282,9 @@ impl App {
         let uuid = self.error_node_uuids[self.current_error_idx].clone();
         self.tree_state.select(vec![uuid]);
         self.details_scroll = 0;
-        self.status_message = format!(
-            "Error {}/{}",
-            self.current_error_idx + 1,
-            self.error_node_uuids.len()
-        );
+        self.status_message = format!("Error {}/{}", self.current_error_idx + 1, self.error_node_uuids.len());
     }
 
-    /// Jump to the previous error node in the session
     pub fn jump_to_prev_error(&mut self) {
         if self.error_node_uuids.is_empty() {
             self.status_message = "No errors in this session".to_string();
@@ -354,16 +298,9 @@ impl App {
         let uuid = self.error_node_uuids[self.current_error_idx].clone();
         self.tree_state.select(vec![uuid]);
         self.details_scroll = 0;
-        self.status_message = format!(
-            "Error {}/{}",
-            self.current_error_idx + 1,
-            self.error_node_uuids.len()
-        );
+        self.status_message = format!("Error {}/{}", self.current_error_idx + 1, self.error_node_uuids.len());
     }
 
-    // ── #8: Clipboard ────────────────────────────────────────────────────
-
-    /// Copy the rendered content of the selected node to the OS clipboard
     pub fn copy_node_to_clipboard(&mut self) {
         let text = if let Some(node) = self.selected_node() {
             let ctx = crate::tui::render::RenderContext {
@@ -371,16 +308,9 @@ impl App {
                 tool_result_map: &self.tool_result_map,
             };
             let lines = crate::tui::render::render_node_content(node, &ctx);
-            lines
-                .iter()
-                .map(|line| {
-                    line.spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            lines.iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>().join("\n")
         } else {
             self.status_message = "Nothing selected".to_string();
             return;
@@ -395,50 +325,29 @@ impl App {
         }
     }
 
-    // ── #9: Raw JSON view ────────────────────────────────────────────────
-
-    /// Toggle raw JSON display for the selected node
     pub fn toggle_raw_json(&mut self) {
         self.show_raw_json = !self.show_raw_json;
         self.show_diff = false;
-        self.status_message = if self.show_raw_json {
-            "Raw JSON (J: off)".to_string()
-        } else {
-            "Rendered view".to_string()
-        };
+        self.status_message = if self.show_raw_json { "Raw JSON (J: off)".to_string() } else { "Rendered view".to_string() };
     }
 
-    // ── #14: Error summary overlay ────────────────────────────────────────
-
-    /// Toggle the error summary popup
     pub fn toggle_error_summary(&mut self) {
         self.show_error_summary = !self.show_error_summary;
-        if self.show_error_summary {
-            self.error_summary_selection = 0;
-        }
+        if self.show_error_summary { self.error_summary_selection = 0; }
     }
 
-    /// Handle keys when error summary overlay is open
     fn handle_error_summary_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
-        use crossterm::event::KeyCode;
         match key.code {
-            KeyCode::Esc | KeyCode::Char('x') | KeyCode::Char('X') => {
-                self.show_error_summary = false;
-            }
+            KeyCode::Esc | KeyCode::Char('x' | 'X') => self.show_error_summary = false,
             KeyCode::Char('j') | KeyCode::Down => {
                 let max = self.error_nodes_info.len().saturating_sub(1);
-                if self.error_summary_selection < max {
-                    self.error_summary_selection += 1;
-                }
+                if self.error_summary_selection < max { self.error_summary_selection += 1; }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.error_summary_selection > 0 {
-                    self.error_summary_selection -= 1;
-                }
+                if self.error_summary_selection > 0 { self.error_summary_selection -= 1; }
             }
             KeyCode::Enter => {
-                if let Some((uuid, _, _)) = self.error_nodes_info.get(self.error_summary_selection)
-                {
+                if let Some((uuid, _, _)) = self.error_nodes_info.get(self.error_summary_selection) {
                     let uuid = uuid.clone();
                     self.tree_state.select(vec![uuid]);
                     self.details_scroll = 0;
@@ -450,9 +359,6 @@ impl App {
         Ok(())
     }
 
-    // ── #17: Replay mode ─────────────────────────────────────────────────
-
-    /// Toggle auto-replay through tree nodes
     pub fn toggle_replay(&mut self) {
         self.replay_mode = !self.replay_mode;
         if self.replay_mode {
@@ -464,27 +370,18 @@ impl App {
         }
     }
 
-    // ── #18: Diff view ───────────────────────────────────────────────────
-
-    /// Toggle diff view for Edit tool calls
     pub fn toggle_diff(&mut self) {
         self.show_diff = !self.show_diff;
         self.show_raw_json = false;
-        self.status_message = if self.show_diff {
-            "Diff view (d: off)".to_string()
-        } else {
-            "Rendered view".to_string()
-        };
+        self.status_message = if self.show_diff { "Diff view (d: off)".to_string() } else { "Rendered view".to_string() };
     }
 
-    /// Update scroll info (called by UI during rendering)
     pub fn update_scroll_info(&mut self, total_lines: usize, viewport_height: usize) {
         self.details_scroll_info.offset = self.details_scroll;
         self.details_scroll_info.total_lines = total_lines;
         self.details_scroll_info.viewport_height = viewport_height;
     }
 
-    /// Get breadcrumb path for currently selected node
     pub fn get_breadcrumb_path(&self) -> Vec<String> {
         let selected = match self.selected_node() {
             Some(node) => node,
@@ -499,12 +396,7 @@ impl App {
                 let label = match node.node.node_type.as_str() {
                     "user" => "User".to_string(),
                     "assistant" => "Assistant".to_string(),
-                    "tool_use" => node
-                        .node
-                        .tool_use
-                        .as_ref()
-                        .map(|t| format!("Tool:{}", t.name))
-                        .unwrap_or_else(|| "Tool".to_string()),
+                    "tool_use" => node.node.tool_use.as_ref().map(|t| format!("Tool:{}", t.name)).unwrap_or_else(|| "Tool".to_string()),
                     "tool_result" => "Result".to_string(),
                     "thinking" => "Think".to_string(),
                     "progress" => "Progress".to_string(),
@@ -521,66 +413,36 @@ impl App {
         path
     }
 
-    /// Start search mode
     pub fn start_search(&mut self) {
         self.input_mode = true;
         self.search_state = Some(SearchState::new(String::new()));
         self.status_message = "Filter by node type (e.g., user,assistant,tool_use): ".to_string();
     }
 
-    /// Execute search with current query
     pub fn execute_search(&mut self) {
         let first_match_uuid = if let Some(ref mut search) = self.search_state {
-            // Parse the query into node types
             search.parse_query();
             search.matches.clear();
-
-            // Find all matching nodes
             for (uuid, node) in &self.uuid_to_node {
-                if search.matches_node(node) {
-                    search.matches.push(uuid.clone());
-                }
+                if search.matches_node(node) { search.matches.push(uuid.clone()); }
             }
-
             search.current_match = 0;
-
-            let filter_types = search
-                .node_types
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            self.status_message = if search.node_types.is_empty() {
-                "Filter cleared - showing all nodes".to_string()
-            } else {
-                format!(
-                    "Filtered: {} ({} matches)",
-                    filter_types,
-                    search.matches.len()
-                )
-            };
-
+            let filter_types = search.node_types.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+            self.status_message = if search.node_types.is_empty() { "Filter cleared - showing all nodes".to_string() } else { format!("Filtered: {} ({} matches)", filter_types, search.matches.len()) };
             search.current_match_uuid().map(|s| s.to_string())
         } else {
             None
         };
 
-        // Rebuild tree with filtering
         self.rebuild_tree_items();
-
-        // Jump to first match if any
         if let Some(uuid) = first_match_uuid {
             self.tree_state.select(vec![uuid]);
             self.details_scroll = 0;
         }
-
         self.input_mode = false;
     }
 
-    /// Select a node by UUID (used when jumping from search results)
     pub fn select_node_by_uuid(&mut self, uuid: &str) {
-        // Check if the UUID exists in our mapping
         if self.uuid_to_node.contains_key(uuid) {
             self.tree_state.select(vec![uuid.to_string()]);
             self.details_scroll = 0;
@@ -590,18 +452,9 @@ impl App {
         }
     }
 
-    /// Process periodic updates (called on each event loop tick)
-    ///
-    /// Handles debounced search execution - waits 150ms after last keystroke
-    /// before executing the search to avoid rebuilding tree on every character.
-    /// Also advances replay mode every 800ms.
     pub fn tick(&mut self) {
-        // ── #17: Replay advance ──────────────────────────────────────────
         if self.replay_mode {
-            let should_advance = self
-                .last_replay_tick
-                .map(|t| t.elapsed() >= std::time::Duration::from_millis(800))
-                .unwrap_or(true);
+            let should_advance = self.last_replay_tick.map(|t| t.elapsed() >= std::time::Duration::from_millis(800)).unwrap_or(true);
             if should_advance {
                 self.tree_state.key_down();
                 self.details_scroll = 0;
@@ -609,10 +462,8 @@ impl App {
             }
         }
 
-        // Check if we should execute a debounced search
         if let Some(last_input) = self.last_search_input_time {
             if last_input.elapsed() > std::time::Duration::from_millis(150) {
-                // Check if we need to execute search (query has changed)
                 let should_execute = if let Some(ref search) = self.search_state {
                     let current_query = search.query.clone();
                     self.last_search_query.as_ref() != Some(&current_query)
@@ -622,48 +473,35 @@ impl App {
 
                 if should_execute {
                     self.execute_search();
-                    if let Some(ref search) = self.search_state {
-                        self.last_search_query = Some(search.query.clone());
-                    }
+                    if let Some(ref search) = self.search_state { self.last_search_query = Some(search.query.clone()); }
                 }
                 self.last_search_input_time = None;
             }
         }
     }
 
-    /// Jump to next search match
     pub fn next_search_match(&mut self) {
         if let Some(ref mut search) = self.search_state {
             search.next_match();
             if let Some(uuid) = search.current_match_uuid() {
                 self.tree_state.select(vec![uuid.to_string()]);
                 self.details_scroll = 0;
-                self.status_message = format!(
-                    "Match {}/{}",
-                    search.current_match + 1,
-                    search.matches.len()
-                );
+                self.status_message = format!("Match {}/{}", search.current_match + 1, search.matches.len());
             }
         }
     }
 
-    /// Jump to previous search match
     pub fn prev_search_match(&mut self) {
         if let Some(ref mut search) = self.search_state {
             search.prev_match();
             if let Some(uuid) = search.current_match_uuid() {
                 self.tree_state.select(vec![uuid.to_string()]);
                 self.details_scroll = 0;
-                self.status_message = format!(
-                    "Match {}/{}",
-                    search.current_match + 1,
-                    search.matches.len()
-                );
+                self.status_message = format!("Match {}/{}", search.current_match + 1, search.matches.len());
             }
         }
     }
 
-    /// Cancel search
     pub fn cancel_search(&mut self) {
         self.search_state = None;
         self.input_mode = false;
@@ -671,181 +509,94 @@ impl App {
         self.status_message = "Search cancelled".to_string();
     }
 
-    /// Rebuild tree items (used when search state changes)
     pub fn rebuild_tree_items(&mut self) {
-        self.tree_items =
-            build_tree_items(&self.tree_roots, &self.search_state, &self.tool_correlation);
+        self.tree_items = build_tree_items(&self.tree_roots, &self.search_state, &self.tool_correlation);
     }
 
-    /// Handle keyboard input
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
-        // Handle input mode separately
-        if self.input_mode {
-            return self.handle_input_key(key);
-        }
-
-        // ── #14: Error summary overlay intercepts keys ────────────────────
-        if self.show_error_summary {
-            return self.handle_error_summary_key(key);
-        }
-
-        // ── #17: Any key (except P) exits replay mode ────────────────────
+        if self.input_mode { return self.handle_input_key(key); }
+        if self.show_error_summary { return self.handle_error_summary_key(key); }
         if self.replay_mode && !matches!(key.code, KeyCode::Char('p')) {
-            self.replay_mode = false;
-            self.last_replay_tick = None;
-            self.status_message = "■ Replay stopped".to_string();
+            self.toggle_replay();
             return Ok(());
         }
 
         match (key.code, key.modifiers) {
-            // Quit
-            (KeyCode::Char('q'), KeyModifiers::NONE) => {
-                self.should_quit = true;
-            }
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-            }
-
-            // Start search
-            (KeyCode::Char('/'), KeyModifiers::NONE) => {
-                self.start_search();
-            }
-
-            // Next match
-            (KeyCode::Char('n'), KeyModifiers::NONE) => {
-                if self.search_state.is_some() {
-                    self.next_search_match();
-                }
-            }
-
-            // Previous match
-            (KeyCode::Char('N'), KeyModifiers::SHIFT) => {
-                if self.search_state.is_some() {
-                    self.prev_search_match();
-                }
-            }
-
-            // Clear search (Alt+c)
-            (KeyCode::Char('c'), KeyModifiers::ALT) => {
-                if self.search_state.is_some() {
-                    self.cancel_search();
-                }
-            }
-
-            // Navigation - depends on focus mode
-            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
-                match self.focus_mode {
-                    FocusMode::Tree => {
-                        self.tree_state.key_down();
-                        self.details_scroll = 0; // Reset scroll when changing nodes
-                    }
-                    FocusMode::Details => {
-                        self.details_scroll = self.details_scroll.saturating_add(1);
-                    }
-                }
-            }
-            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
-                match self.focus_mode {
-                    FocusMode::Tree => {
-                        self.tree_state.key_up();
-                        self.details_scroll = 0; // Reset scroll when changing nodes
-                    }
-                    FocusMode::Details => {
-                        self.details_scroll = self.details_scroll.saturating_sub(1);
-                    }
-                }
-            }
-
-            // Half-page scroll (Ctrl+d/u)
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                if self.focus_mode == FocusMode::Details {
-                    self.details_scroll = self.details_scroll.saturating_add(15);
-                    self.status_message = "↓ Half page".to_string();
-                }
-            }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                if self.focus_mode == FocusMode::Details {
-                    self.details_scroll = self.details_scroll.saturating_sub(15);
-                    self.status_message = "↑ Half page".to_string();
-                }
-            }
-
-            // Full-page scroll (Ctrl+f/b or PageDown/PageUp)
-            (KeyCode::Char('f'), KeyModifiers::CONTROL) | (KeyCode::PageDown, _) => {
-                if self.focus_mode == FocusMode::Details {
-                    self.details_scroll = self.details_scroll.saturating_add(30);
-                    self.status_message = "↓ Full page".to_string();
-                }
-            }
-            (KeyCode::Char('b'), KeyModifiers::CONTROL) | (KeyCode::PageUp, _) => {
-                if self.focus_mode == FocusMode::Details {
-                    self.details_scroll = self.details_scroll.saturating_sub(30);
-                    self.status_message = "↑ Full page".to_string();
-                }
-            }
-
-            // Focus switching
-            (KeyCode::Tab, KeyModifiers::NONE) => {
-                self.focus_mode = match self.focus_mode {
-                    FocusMode::Tree => {
-                        self.status_message = "Focus: Details (use j/k to scroll)".to_string();
-                        FocusMode::Details
-                    }
-                    FocusMode::Details => {
-                        self.status_message = "Focus: List".to_string();
-                        FocusMode::Tree
-                    }
-                };
-            }
-
-            // Home/End
-            (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                self.tree_state.select_first();
-                self.status_message = "↑ Top".to_string();
-            }
-            (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => {
-                self.tree_state.select_last();
-                self.status_message = "↓ Bottom".to_string();
-            }
-
-            // ── #7: Error navigation ──────────────────────────────────────
+            (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+            (KeyCode::Char('/'), KeyModifiers::NONE) => self.start_search(),
+            (KeyCode::Char('n'), KeyModifiers::NONE) => if self.search_state.is_some() { self.next_search_match(); },
+            (KeyCode::Char('N'), KeyModifiers::SHIFT) => if self.search_state.is_some() { self.prev_search_match(); },
+            (KeyCode::Char('c'), KeyModifiers::ALT) => if self.search_state.is_some() { self.cancel_search(); },
+            (KeyCode::Char('j') | KeyCode::Down, _) => self.nav_down(),
+            (KeyCode::Char('k') | KeyCode::Up, _) => self.nav_up(),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => self.scroll_details(15),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => self.scroll_details(-15),
+            (KeyCode::Char('f') | KeyCode::PageDown, _) => self.scroll_details(30),
+            (KeyCode::Char('b') | KeyCode::PageUp, _) => self.scroll_details(-30),
+            (KeyCode::Tab, KeyModifiers::NONE) => self.toggle_focus(),
+            (KeyCode::Home | KeyCode::Char('g'), _) => self.nav_top(),
+            (KeyCode::End | KeyCode::Char('G'), _) => self.nav_bottom(),
             (KeyCode::Char('e'), KeyModifiers::NONE) => self.jump_to_next_error(),
             (KeyCode::Char('E'), KeyModifiers::SHIFT) => self.jump_to_prev_error(),
-
-            // ── #8: Clipboard ─────────────────────────────────────────────
             (KeyCode::Char('y'), KeyModifiers::NONE) => self.copy_node_to_clipboard(),
-
-            // ── #9: Raw JSON view ─────────────────────────────────────────
             (KeyCode::Char('J'), KeyModifiers::SHIFT) => self.toggle_raw_json(),
-
-            // ── #14: Error summary overlay ────────────────────────────────
-            (KeyCode::Char('x'), KeyModifiers::NONE)
-            | (KeyCode::Char('X'), KeyModifiers::SHIFT) => {
-                self.toggle_error_summary();
-            }
-
-            // ── #17: Replay mode ──────────────────────────────────────────
+            (KeyCode::Char('x') | KeyCode::Char('X'), _) => self.toggle_error_summary(),
             (KeyCode::Char('p'), KeyModifiers::NONE) => self.toggle_replay(),
-
-            // ── #18: Diff view ────────────────────────────────────────────
             (KeyCode::Char('d'), KeyModifiers::NONE) => self.toggle_diff(),
-
             _ => {}
         }
-
         Ok(())
     }
 
-    /// Handle keyboard input in input mode (for search)
+    fn nav_down(&mut self) {
+        match self.focus_mode {
+            FocusMode::Tree => { self.tree_state.key_down(); self.details_scroll = 0; }
+            FocusMode::Details => { self.details_scroll = self.details_scroll.saturating_add(1); }
+        }
+    }
+
+    fn nav_up(&mut self) {
+        match self.focus_mode {
+            FocusMode::Tree => { self.tree_state.key_up(); self.details_scroll = 0; }
+            FocusMode::Details => { self.details_scroll = self.details_scroll.saturating_sub(1); }
+        }
+    }
+
+    fn scroll_details(&mut self, delta: i32) {
+        if self.focus_mode == FocusMode::Details {
+            if delta > 0 {
+                self.details_scroll = self.details_scroll.saturating_add(delta as usize);
+                self.status_message = format!("↓ Scroll {}", if delta > 20 { "page" } else { "half" });
+            } else {
+                self.details_scroll = self.details_scroll.saturating_sub(delta.unsigned_abs() as usize);
+                self.status_message = format!("↑ Scroll {}", if delta < -20 { "page" } else { "half" });
+            }
+        }
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus_mode = match self.focus_mode {
+            FocusMode::Tree => { self.status_message = "Focus: Details".into(); FocusMode::Details }
+            FocusMode::Details => { self.status_message = "Focus: Tree".into(); FocusMode::Tree }
+        };
+    }
+
+    fn nav_top(&mut self) {
+        self.tree_state.select_first();
+        self.status_message = "↑ Top".into();
+    }
+
+    fn nav_bottom(&mut self) {
+        self.tree_state.select_last();
+        self.status_message = "↓ Bottom".into();
+    }
+
     fn handle_input_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Enter => {
-                // Immediate execution on Enter (no debouncing)
                 self.execute_search();
                 self.last_search_input_time = None;
-                if let Some(ref search) = self.search_state {
-                    self.last_search_query = Some(search.query.clone());
-                }
+                if let Some(ref search) = self.search_state { self.last_search_query = Some(search.query.clone()); }
             }
             KeyCode::Esc => {
                 self.cancel_search();
@@ -856,7 +607,6 @@ impl App {
                 if let Some(ref mut search) = self.search_state {
                     search.query.pop();
                     self.status_message = format!("Search: {}", search.query);
-                    // Set debounce timer for search execution
                     self.last_search_input_time = Some(std::time::Instant::now());
                 }
             }
@@ -864,7 +614,6 @@ impl App {
                 if let Some(ref mut search) = self.search_state {
                     search.query.push(c);
                     self.status_message = format!("Search: {}", search.query);
-                    // Set debounce timer for search execution
                     self.last_search_input_time = Some(std::time::Instant::now());
                 }
             }
@@ -873,16 +622,9 @@ impl App {
         Ok(())
     }
 
-    /// Get the currently selected node
     pub fn selected_node(&self) -> Option<&TreeNode> {
-        // Get selected UUID from tree state
         let selected = self.tree_state.selected();
-        if let Some(uuid) = selected.first() {
-            // Look up node by UUID
-            self.uuid_to_node.get(uuid)
-        } else {
-            None
-        }
+        if let Some(uuid) = selected.first() { self.uuid_to_node.get(uuid) } else { None }
     }
 }
 

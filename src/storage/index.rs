@@ -7,6 +7,16 @@ use crate::storage::SessionFile;
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
+/// Helper struct for internal session data extraction.
+struct ExtractedData {
+    model: Option<String>,
+    error_count: i64,
+    first_message: Option<String>,
+    tool_counts: Option<std::collections::HashMap<String, usize>>,
+    file_counts: Option<std::collections::HashMap<String, usize>>,
+    created_at: i64,
+}
+
 /// SQLite-based session index for fast lookups
 pub struct SessionIndex {
     conn: Connection,
@@ -180,106 +190,11 @@ impl SessionIndex {
 
     /// Index a single session file
     pub fn index_session(&mut self, session: &SessionFile) -> Result<()> {
-        use std::collections::HashMap;
-
-        let indexed_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        // Try to parse session for rich analytics; fall back to defaults on failure
-        let (model, error_count, first_message, tool_counts, file_counts, created_at) =
-            if let Ok(parsed) = crate::parser::parse_session(&session.path) {
-                let analytics = crate::analyzer::SessionAnalytics::from_session(&parsed);
-
-                // Earliest node timestamp → session creation time (ms → secs)
-                let created_at = parsed
-                    .nodes
-                    .iter()
-                    .find_map(|n| n.timestamp)
-                    .map(|ms| ms / 1000)
-                    .unwrap_or(session.modified_at);
-
-                // First user message text preview.
-                let first_message: Option<String> = parsed
-                    .nodes
-                    .iter()
-                    .filter(|n| n.node_type == "user")
-                    .find_map(|n| {
-                        let text = n.message.as_ref()?.text_content();
-                        let trimmed = text.trim().to_string();
-                        if trimmed.is_empty() {
-                            return None;
-                        }
-                        let preview = trimmed.replace('\n', " ");
-                        Some(preview.chars().take(80).collect::<String>())
-                    });
-
-                // Build tool counts and file access counts
-                let mut tool_counts: HashMap<String, usize> = HashMap::new();
-                let mut file_counts: HashMap<String, usize> = HashMap::new();
-                for node in &parsed.nodes {
-                    if let Some(ref tool_use) = node.tool_use {
-                        *tool_counts.entry(tool_use.name.clone()).or_insert(0) += 1;
-                        if let Some(path) = file_path_from_input(&tool_use.name, &tool_use.input) {
-                            *file_counts.entry(path).or_insert(0) += 1;
-                        }
-                    }
-                    for block in node
-                        .message
-                        .as_ref()
-                        .map(|m| m.content_blocks())
-                        .unwrap_or(&[])
-                    {
-                        if let crate::parser::models::ContentBlock::ToolUse { name, input, .. } =
-                            block
-                        {
-                            *tool_counts.entry(name.clone()).or_insert(0) += 1;
-                            if let Some(path) = file_path_from_input(name, input) {
-                                *file_counts.entry(path).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                }
-
-                (
-                    parsed.model.clone(),
-                    analytics.error_count as i64,
-                    first_message,
-                    Some(tool_counts),
-                    Some(file_counts),
-                    created_at,
-                )
-            } else {
-                (
-                    None::<String>,
-                    0i64,
-                    None::<String>,
-                    None,
-                    None,
-                    session.modified_at,
-                )
-            };
-
-        // Collect subagent models
-        let subagent_sessions = crate::parser::parse_subagents(&session.path);
-
-        let mut sub_models: Vec<String> = subagent_sessions
-            .iter()
-            .filter_map(|s| s.model.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        sub_models.sort();
-        let subagent_models_str: Option<String> = if sub_models.is_empty() {
-            None
-        } else {
-            Some(sub_models.join(","))
-        };
+        let (extracted, subagent_models) = self.extract_session_data(session);
 
         // Skip sessions with no meaningful content (file-history-snapshots, abandoned
         // test files, etc.). Remove from index if previously added.
-        if model.is_none() && first_message.is_none() {
+        if extracted.model.is_none() && extracted.first_message.is_none() {
             self.conn.execute(
                 "DELETE FROM sessions WHERE session_id = ?1",
                 params![session.session_id],
@@ -287,10 +202,98 @@ impl SessionIndex {
             return Ok(());
         }
 
-        // Start a transaction for atomic updates
+        self.update_database(session, extracted, subagent_models)?;
+        Ok(())
+    }
+
+    /// Extract rich metadata and analytics from a session file.
+    fn extract_session_data(&self, session: &SessionFile) -> (ExtractedData, Option<String>) {
+        use std::collections::HashMap;
+
+        let extracted = if let Ok(parsed) = crate::parser::parse_session(&session.path) {
+            let analytics = crate::analyzer::SessionAnalytics::from_session(&parsed);
+
+            let created_at = parsed
+                .nodes
+                .iter()
+                .find_map(|n| n.timestamp)
+                .map(|ms| ms / 1000)
+                .unwrap_or(session.modified_at);
+
+            let first_message = parsed
+                .nodes
+                .iter()
+                .filter(|n| n.node_type == "user")
+                .find_map(|n| {
+                    let text = n.message.as_ref()?.text_content();
+                    let trimmed = text.trim().to_string();
+                    if trimmed.is_empty() { return None; }
+                    let preview = trimmed.replace('\n', " ");
+                    Some(preview.chars().take(80).collect::<String>())
+                });
+
+            let mut tool_counts: HashMap<String, usize> = HashMap::new();
+            let mut file_counts: HashMap<String, usize> = HashMap::new();
+            for node in &parsed.nodes {
+                if let Some(ref tool_use) = node.tool_use {
+                    *tool_counts.entry(tool_use.name.clone()).or_insert(0) += 1;
+                    if let Some(path) = file_path_from_input(&tool_use.name, &tool_use.input) {
+                        *file_counts.entry(path).or_insert(0) += 1;
+                    }
+                }
+                for block in node.message.as_ref().map(|m| m.content_blocks()).unwrap_or(&[]) {
+                    if let crate::parser::models::ContentBlock::ToolUse { name, input, .. } = block {
+                        *tool_counts.entry(name.clone()).or_insert(0) += 1;
+                        if let Some(path) = file_path_from_input(name, input) {
+                            *file_counts.entry(path).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            ExtractedData {
+                model: parsed.model.clone(),
+                error_count: analytics.error_count as i64,
+                first_message,
+                tool_counts: Some(tool_counts),
+                file_counts: Some(file_counts),
+                created_at,
+            }
+        } else {
+            ExtractedData {
+                model: None,
+                error_count: 0,
+                first_message: None,
+                tool_counts: None,
+                file_counts: None,
+                created_at: session.modified_at,
+            }
+        };
+
+        // Collect subagent models
+        let subagent_sessions = crate::parser::parse_subagents(&session.path);
+        let mut sub_models: Vec<String> = subagent_sessions
+            .iter()
+            .filter_map(|s| s.model.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        sub_models.sort();
+        let subagent_models_str = if sub_models.is_empty() { None } else { Some(sub_models.join(",")) };
+
+        (extracted, subagent_models_str)
+    }
+
+    /// Perform atomic database updates for an indexed session.
+    fn update_database(&mut self, session: &SessionFile, data: ExtractedData, subagent_models: Option<String>) -> Result<()> {
+        let indexed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
         let tx = self.conn.transaction()?;
 
-        // Insert/update session metadata with analytics
+        // 1. Core Metadata
         tx.execute(
             r#"
             INSERT OR REPLACE INTO sessions
@@ -299,69 +302,38 @@ impl SessionIndex {
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             "#,
             params![
-                session.session_id,
-                session.project_name,
-                session.path.to_string_lossy(),
-                session.file_size as i64,
-                created_at,
-                session.modified_at,
-                if session.has_subagents { 1 } else { 0 },
-                indexed_at,
-                model,
-                error_count,
-                first_message,
-                session.source_dir,
-                subagent_models_str,
+                session.session_id, session.project_name, session.path.to_string_lossy(),
+                session.file_size as i64, data.created_at, session.modified_at,
+                if session.has_subagents { 1 } else { 0 }, indexed_at,
+                data.model, data.error_count, data.first_message,
+                session.source_dir, subagent_models,
             ],
         )?;
 
-        // Refresh FTS entry (delete-then-insert is the correct FTS5 update pattern)
-        tx.execute(
-            "DELETE FROM sessions_fts WHERE session_id = ?1",
-            params![session.session_id],
-        )?;
+        // 2. FTS Refresh
+        tx.execute("DELETE FROM sessions_fts WHERE session_id = ?1", params![session.session_id])?;
         tx.execute(
             "INSERT INTO sessions_fts (session_id, searchable_text) VALUES (?1, ?2)",
             params![
                 session.session_id,
-                format!(
-                    "{} {} {}",
-                    session.project_name,
-                    first_message.as_deref().unwrap_or(""),
-                    model.as_deref().unwrap_or(""),
-                ),
+                format!("{} {} {}", session.project_name, data.first_message.as_deref().unwrap_or(""), data.model.as_deref().unwrap_or("")),
             ],
         )?;
 
-        // Update tool_usage if we successfully parsed
-        if let Some(tool_counts) = tool_counts {
-            tx.execute(
-                "DELETE FROM tool_usage WHERE session_id = ?1",
-                params![session.session_id],
-            )?;
-
-            let mut stmt = tx.prepare(
-                "INSERT INTO tool_usage (session_id, tool_name, usage_count) VALUES (?1, ?2, ?3)",
-            )?;
-
-            for (tool_name, count) in tool_counts {
-                stmt.execute(params![session.session_id, tool_name, count as i64])?;
+        // 3. Usage Tables
+        if let Some(counts) = data.tool_counts {
+            tx.execute("DELETE FROM tool_usage WHERE session_id = ?1", params![session.session_id])?;
+            let mut stmt = tx.prepare("INSERT INTO tool_usage (session_id, tool_name, usage_count) VALUES (?1, ?2, ?3)")?;
+            for (name, count) in counts {
+                stmt.execute(params![session.session_id, name, count as i64])?;
             }
         }
 
-        // Update file_usage if we successfully parsed
-        if let Some(file_counts) = file_counts {
-            tx.execute(
-                "DELETE FROM file_usage WHERE session_id = ?1",
-                params![session.session_id],
-            )?;
-
-            let mut stmt = tx.prepare(
-                "INSERT INTO file_usage (session_id, file_path, access_count) VALUES (?1, ?2, ?3)",
-            )?;
-
-            for (file_path, count) in file_counts {
-                stmt.execute(params![session.session_id, file_path, count as i64])?;
+        if let Some(counts) = data.file_counts {
+            tx.execute("DELETE FROM file_usage WHERE session_id = ?1", params![session.session_id])?;
+            let mut stmt = tx.prepare("INSERT INTO file_usage (session_id, file_path, access_count) VALUES (?1, ?2, ?3)")?;
+            for (path, count) in counts {
+                stmt.execute(params![session.session_id, path, count as i64])?;
             }
         }
 
